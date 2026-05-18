@@ -129,20 +129,35 @@ def ask_install_target() -> tuple[str, Path]:
             return "project", root / ".claude" / "guard"
 
 
+def _same_dir(a: Path, b: Path) -> bool:
+    try:
+        return a.resolve() == b.resolve()
+    except OSError:
+        return str(a).rstrip("\\/").lower() == str(b).rstrip("\\/").lower()
+
+
 def copy_files(src: Path, dst: Path) -> int:
     dst.mkdir(parents=True, exist_ok=True)
+    in_place = _same_dir(src, dst)
+    if in_place:
+        info("source and install directory are the same; "
+             "skipping file copy (cloned in place).")
     copied = 0
     for name in FILES:
         s = src / name
         if not s.exists():
             warn(f"source file missing, skipping: {name}")
             continue
+        if in_place:
+            copied += 1
+            continue
         shutil.copy2(s, dst / name)
         copied += 1
     for name in OPTIONAL_FILES:
         s = src / name
         if s.exists():
-            shutil.copy2(s, dst / name)
+            if not in_place:
+                shutil.copy2(s, dst / name)
             copied += 1
     return copied
 

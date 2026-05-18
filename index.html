@@ -824,15 +824,17 @@ footer .credit {
         <span class="install-card__label">install</span>
         <div class="install-card__tabs" role="tablist" aria-label="Operating system">
           <button class="install-card__tab" role="tab" aria-selected="true"  aria-controls="cmd-unix"    id="tab-unix"    data-target="cmd-unix">macOS / Linux</button>
-          <button class="install-card__tab" role="tab" aria-selected="false" aria-controls="cmd-windows" id="tab-windows" data-target="cmd-windows">Windows</button>
+          <button class="install-card__tab" role="tab" aria-selected="false" aria-controls="cmd-windows" id="tab-windows" data-target="cmd-windows">Windows (PowerShell)</button>
+          <button class="install-card__tab" role="tab" aria-selected="false" aria-controls="cmd-cmd"     id="tab-cmd"     data-target="cmd-cmd">Windows (cmd)</button>
         </div>
       </div>
       <div class="install-card__body">
         <pre class="install-card__cmd" id="cmd-unix"    role="tabpanel" aria-labelledby="tab-unix"    data-active="true"><code><span class="prompt">$</span>git clone https://github.com/Gabriel-Dalton/claude-guard ~/.claude/guard &amp;&amp; python ~/.claude/guard/install.py</code></pre>
         <pre class="install-card__cmd" id="cmd-windows" role="tabpanel" aria-labelledby="tab-windows"><code><span class="prompt">&gt;</span>git clone https://github.com/Gabriel-Dalton/claude-guard "$env:USERPROFILE\.claude\guard"; python "$env:USERPROFILE\.claude\guard\install.py"</code></pre>
+        <pre class="install-card__cmd" id="cmd-cmd"     role="tabpanel" aria-labelledby="tab-cmd"><code><span class="prompt">&gt;</span>git clone https://github.com/Gabriel-Dalton/claude-guard "%USERPROFILE%\.claude\guard" &amp;&amp; python "%USERPROFILE%\.claude\guard\install.py"</code></pre>
         <button class="install-card__copy" type="button" id="copy-btn" aria-label="Copy install command to clipboard">copy</button>
       </div>
-      <p class="install-card__note">One line. The installer asks where to put it (global, fires for every project; or per-project), copies the files, wires the hook into your Claude Code settings.json. No telemetry. No daemon.</p>
+      <p class="install-card__note">One line. Pick the tab that matches the shell you're running in &mdash; PowerShell uses <code>$env:USERPROFILE</code> and <code>;</code>, cmd.exe uses <code>%USERPROFILE%</code> and <code>&amp;&amp;</code>. The installer asks where to put it (global, fires for every project; or per-project), copies the files, wires the hook into your Claude Code settings.json. No telemetry. No daemon.</p>
     </div>
 
     <div class="stats" role="list">
@@ -1027,6 +1029,10 @@ footer .credit {
           <pre class="code-block"><span class="p">&gt;</span> git clone https://github.com/Gabriel-Dalton/claude-guard `
     "<span class="c">$env:USERPROFILE</span>\.claude\guard"; <span class="c">`</span>
   python "<span class="c">$env:USERPROFILE</span>\.claude\guard\install.py"</pre>
+
+          <h4 style="margin-top:1.5rem">Windows (cmd.exe)</h4>
+          <pre class="code-block"><span class="p">&gt;</span> git clone https://github.com/Gabriel-Dalton/claude-guard "<span class="c">%USERPROFILE%</span>\.claude\guard" ^
+    &amp;&amp; python "<span class="c">%USERPROFILE%</span>\.claude\guard\install.py"</pre>
         </div>
       </div>
 
