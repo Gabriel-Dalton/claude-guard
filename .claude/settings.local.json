@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python claude-guard.py --test)",
+      "PowerShell(Get-Command *)",
+      "Read(//c/Users/Gabriel-Dalton/AppData/Local/Programs/Python/Python312/**)",
+      "Bash(/c/Users/Gabriel-Dalton/AppData/Local/Programs/Python/Python312/python.exe --version)",
+      "Bash($PYEXE *)",
+      "Bash(/c/Users/Gabriel-Dalton/AppData/Local/Programs/Python/Python312/python.exe -c 'import rules; print\\('\\\\''OK; COMPROMISED npm:'\\\\'', len\\(rules.COMPROMISED_PACKAGES['\\\\''npm'\\\\'']\\), '\\\\''pypi:'\\\\'', len\\(rules.COMPROMISED_PACKAGES['\\\\''pypi'\\\\'']\\), '\\\\''FAIL_MODE:'\\\\'', rules.FAIL_MODE\\)')",
+      "Bash(/c/Users/Gabriel-Dalton/AppData/Local/Programs/Python/Python312/python.exe claude-guard.py --test)"
+    ]
+  }
+}

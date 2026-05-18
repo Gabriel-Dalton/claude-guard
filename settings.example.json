@@ -1,0 +1,34 @@
+{
+  "_comment_for_humans": "Merge the 'hooks' block below into your existing .claude/settings.json. The path command assumes claude-guard.py lives at .claude/guard/claude-guard.py inside your project. Adjust if you put it somewhere else.",
+
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"$CLAUDE_PROJECT_DIR/.claude/guard/claude-guard.py\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  },
+
+  "_comment_on_permissions": "You can ALSO keep Claude Code's native permissions block for fast-path allows/denies. It runs before the hook, so anything matched here skips the scoring entirely.",
+  "permissions": {
+    "allow": [
+      "Bash(git status)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(npm test)",
+      "Bash(npm run *)",
+      "Bash(ls:*)"
+    ],
+    "deny": [
+      "Bash(rm -rf /*)",
+      "Bash(sudo *)"
+    ]
+  }
+}
