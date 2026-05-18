@@ -7,7 +7,9 @@
       "Bash(/c/Users/Gabriel-Dalton/AppData/Local/Programs/Python/Python312/python.exe --version)",
       "Bash($PYEXE *)",
       "Bash(/c/Users/Gabriel-Dalton/AppData/Local/Programs/Python/Python312/python.exe -c 'import rules; print\\('\\\\''OK; COMPROMISED npm:'\\\\'', len\\(rules.COMPROMISED_PACKAGES['\\\\''npm'\\\\'']\\), '\\\\''pypi:'\\\\'', len\\(rules.COMPROMISED_PACKAGES['\\\\''pypi'\\\\'']\\), '\\\\''FAIL_MODE:'\\\\'', rules.FAIL_MODE\\)')",
-      "Bash(/c/Users/Gabriel-Dalton/AppData/Local/Programs/Python/Python312/python.exe claude-guard.py --test)"
+      "Bash(/c/Users/Gabriel-Dalton/AppData/Local/Programs/Python/Python312/python.exe claude-guard.py --test)",
+      "Skill(frontend-design:frontend-design)",
+      "Bash(awk '{print $1, \"bytes \\(\", $1/1024, \"KB\\)\"}')"
     ]
   }
 }

@@ -1,0 +1,1199 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>claude-guard. The missing permission layer for Claude Code.</title>
+<meta name="description" content="A PreToolUse hook that scores every shell command Claude Code wants to run, silently allows the safe ones, asks on ambiguous ones, blocks the dangerous ones. 200,000+ malicious packages tracked. Zero dependencies.">
+<meta name="color-scheme" content="dark">
+<meta property="og:title" content="claude-guard">
+<meta property="og:description" content="Lets Claude Code work. Stops it from wrecking your machine.">
+<meta property="og:type" content="website">
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400..900&family=IBM+Plex+Mono:wght@300;400;500;600&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+
+<style>
+:root {
+  --bg:           #0b0c0e;
+  --bg-elev:      #131418;
+  --bg-elev-2:    #191b20;
+  --bg-elev-3:    #20242a;
+  --fg:           #e8e2d3;
+  --fg-dim:       #b6b0a3;
+  --fg-soft:      #8a8479;
+  --fg-faint:     #5a554d;
+  --accent:       #d4a05a;
+  --accent-soft:  #b88847;
+  --accent-tint:  rgba(212, 160, 90, 0.10);
+  --good:         #8aa66f;
+  --warn:         #d4a05a;
+  --bad:          #b85847;
+  --border:       #262a31;
+  --border-soft:  #1b1e23;
+  --border-strong:#3d434c;
+
+  --font-display: 'Fraunces', 'Iowan Old Style', 'Palatino Linotype', Georgia, serif;
+  --font-sans:    'IBM Plex Sans', system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-mono:    'IBM Plex Mono', 'JetBrains Mono', 'Cascadia Code', Menlo, Consolas, monospace;
+
+  --measure: 65ch;
+  --gutter: clamp(1.25rem, 4vw, 2.5rem);
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html {
+  background: var(--bg);
+  color-scheme: dark;
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  background:
+    radial-gradient(1200px 600px at 50% -200px, rgba(212, 160, 90, 0.06), transparent 60%),
+    radial-gradient(800px 400px at 90% 10%, rgba(138, 166, 111, 0.04), transparent 60%),
+    var(--bg);
+  background-attachment: fixed;
+  color: var(--fg);
+  font-family: var(--font-sans);
+  font-size: 16px;
+  line-height: 1.55;
+  font-weight: 400;
+  font-feature-settings: "ss01", "ss02", "cv11";
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+::selection {
+  background: var(--accent);
+  color: #1a1306;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+  border-bottom: 1px solid var(--accent-soft);
+  transition: color 0.15s ease, border-color 0.15s ease;
+}
+a:hover, a:focus-visible {
+  color: var(--fg);
+  border-color: var(--fg);
+}
+a:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+}
+
+code, pre, .mono { font-family: var(--font-mono); }
+
+p { margin: 0 0 1em; max-width: var(--measure); }
+.no-measure p { max-width: none; }
+
+h1, h2, h3, h4 {
+  font-family: var(--font-display);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  line-height: 1.05;
+  margin: 0;
+  color: var(--fg);
+}
+
+h2 {
+  font-size: clamp(2rem, 5vw, 3.25rem);
+  font-variation-settings: "opsz" 96, "wght" 600;
+}
+h3 {
+  font-size: clamp(1.25rem, 2.5vw, 1.5rem);
+  font-variation-settings: "opsz" 30, "wght" 600;
+  font-weight: 600;
+}
+h4 {
+  font-family: var(--font-sans);
+  font-size: 0.78rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  font-weight: 500;
+  color: var(--fg-soft);
+  margin: 0 0 0.5rem;
+}
+
+/* ─── terminal-style status bar ─────────────────────────────────────────── */
+.statusbar {
+  position: sticky;
+  top: 0;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  gap: 0.85rem;
+  padding: 0.55rem var(--gutter);
+  background: rgba(11, 12, 14, 0.85);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  border-bottom: 1px solid var(--border-soft);
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  color: var(--fg-soft);
+}
+.statusbar .dots {
+  display: inline-flex;
+  gap: 0.4rem;
+}
+.statusbar .dot {
+  width: 10px; height: 10px;
+  border-radius: 50%;
+  background: var(--fg-faint);
+}
+.statusbar .dot.red    { background: var(--bad); }
+.statusbar .dot.amber  { background: var(--accent); }
+.statusbar .dot.green  { background: var(--good); }
+.statusbar .path {
+  color: var(--fg-dim);
+}
+.statusbar .spacer { flex: 1; }
+.statusbar .ver {
+  color: var(--accent);
+}
+
+/* ─── shared section layout ─────────────────────────────────────────────── */
+section {
+  padding: clamp(4rem, 8vw, 7rem) var(--gutter);
+  position: relative;
+}
+.wrap {
+  max-width: 1100px;
+  margin-inline: auto;
+}
+.eyebrow {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  color: var(--fg-soft);
+  display: inline-flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin-bottom: 1.5rem;
+}
+.eyebrow::before {
+  content: "";
+  width: 1.5rem;
+  height: 1px;
+  background: var(--accent);
+}
+
+/* ─── hero ─────────────────────────────────────────────────────────────── */
+.hero {
+  padding-top: clamp(3.5rem, 7vw, 6rem);
+  padding-bottom: clamp(3.5rem, 7vw, 6rem);
+  overflow: hidden;
+}
+.hero .brand {
+  font-family: var(--font-display);
+  font-variation-settings: "opsz" 144, "wght" 500, "SOFT" 0;
+  font-weight: 500;
+  font-size: clamp(3.5rem, 13vw, 10.5rem);
+  line-height: 0.92;
+  letter-spacing: -0.04em;
+  margin: 0;
+  color: var(--fg);
+}
+.hero .brand .sep {
+  color: var(--accent);
+  font-variation-settings: "opsz" 144, "wght" 700;
+  padding: 0 0.04em;
+  display: inline-block;
+  transform: translateY(-0.06em);
+}
+.hero .tagline {
+  font-family: var(--font-display);
+  font-variation-settings: "opsz" 48, "wght" 400;
+  font-size: clamp(1.25rem, 2.5vw, 1.65rem);
+  line-height: 1.35;
+  color: var(--fg-dim);
+  font-style: italic;
+  margin: 1.5rem 0 0;
+  max-width: 32ch;
+}
+.hero .subhead {
+  margin: 1.75rem 0 0;
+  font-size: 1.0625rem;
+  color: var(--fg-dim);
+  max-width: 48ch;
+}
+
+/* ─── install command (hero centerpiece) ────────────────────────────────── */
+.install-card {
+  margin-top: 2.5rem;
+  border: 1px solid var(--border);
+  background: linear-gradient(180deg, var(--bg-elev) 0%, var(--bg-elev-2) 100%);
+  border-radius: 4px;
+  overflow: hidden;
+  box-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.04) inset,
+    0 20px 60px -20px rgba(0, 0, 0, 0.5);
+}
+.install-card__head {
+  display: flex;
+  align-items: stretch;
+  border-bottom: 1px solid var(--border-soft);
+  background: var(--bg-elev);
+}
+.install-card__label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.6rem 0.9rem;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--fg-soft);
+  border-right: 1px solid var(--border-soft);
+}
+.install-card__label::before {
+  content: "";
+  width: 6px; height: 6px;
+  background: var(--good);
+  border-radius: 50%;
+  box-shadow: 0 0 8px var(--good);
+}
+.install-card__tabs {
+  display: flex;
+  flex: 1;
+}
+.install-card__tab {
+  padding: 0.55rem 1rem;
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  color: var(--fg-soft);
+  border-right: 1px solid var(--border-soft);
+  position: relative;
+  cursor: pointer;
+  transition: color 0.15s ease, background 0.15s ease;
+}
+.install-card__tab:hover { color: var(--fg); }
+.install-card__tab[aria-selected="true"] {
+  color: var(--fg);
+  background: var(--bg-elev-2);
+}
+.install-card__tab[aria-selected="true"]::after {
+  content: "";
+  position: absolute;
+  left: 0; right: 0; bottom: -1px;
+  height: 1px;
+  background: var(--accent);
+}
+.install-card__body {
+  position: relative;
+  padding: 1.5rem 1.25rem 1.25rem;
+}
+.install-card__cmd {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: clamp(0.85rem, 1.7vw, 1rem);
+  line-height: 1.55;
+  color: var(--fg);
+  white-space: pre-wrap;
+  word-break: break-word;
+  display: none;
+}
+.install-card__cmd[data-active="true"] { display: block; }
+.install-card__cmd .prompt {
+  user-select: none;
+  color: var(--accent);
+  margin-right: 0.55rem;
+  font-weight: 500;
+}
+.install-card__copy {
+  position: absolute;
+  top: 0.9rem;
+  right: 0.9rem;
+  padding: 0.4rem 0.8rem;
+  border: 1px solid var(--border-strong);
+  background: var(--bg-elev);
+  color: var(--fg-dim);
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  border-radius: 2px;
+  transition: all 0.15s ease;
+}
+.install-card__copy:hover {
+  color: var(--fg);
+  border-color: var(--accent-soft);
+}
+.install-card__copy:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.install-card__copy[data-copied="true"] {
+  color: var(--good);
+  border-color: var(--good);
+}
+.install-card__note {
+  margin: 1.25rem 1.25rem 1.25rem;
+  padding-top: 1rem;
+  border-top: 1px dashed var(--border-soft);
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  color: var(--fg-soft);
+  line-height: 1.5;
+}
+
+/* ─── stats row ────────────────────────────────────────────────────────── */
+.stats {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 1px;
+  margin-top: 3rem;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  background: var(--border);
+}
+.stat {
+  background: var(--bg);
+  padding: 1.5rem 1.25rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+.stat__num {
+  font-family: var(--font-display);
+  font-variation-settings: "opsz" 80, "wght" 500;
+  font-size: clamp(1.75rem, 3vw, 2.4rem);
+  line-height: 1;
+  color: var(--fg);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.02em;
+}
+.stat__num.is-mono {
+  font-family: var(--font-mono);
+  font-size: clamp(1.6rem, 3vw, 2.2rem);
+  font-variation-settings: normal;
+}
+.stat__caption {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--fg-soft);
+  line-height: 1.4;
+}
+@media (max-width: 720px) {
+  .stats { grid-template-columns: repeat(2, 1fr); }
+}
+
+/* ─── problem section (three paths) ────────────────────────────────────── */
+.problem {
+  border-top: 1px solid var(--border-soft);
+}
+.problem h2 {
+  font-style: italic;
+  font-variation-settings: "opsz" 96, "wght" 500;
+}
+.problem h2 em {
+  font-style: normal;
+  color: var(--accent);
+}
+.three-paths {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1.25rem;
+  margin-top: 3rem;
+}
+@media (max-width: 880px) {
+  .three-paths { grid-template-columns: 1fr; }
+}
+.path-card {
+  border: 1px solid var(--border);
+  background: var(--bg-elev);
+  padding: 1.75rem 1.5rem 1.5rem;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
+.path-card__verdict {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  color: var(--fg-soft);
+  margin-bottom: 1rem;
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+}
+.path-card__verdict::before {
+  content: "";
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.path-card--noisy   .path-card__verdict { color: var(--warn); }
+.path-card--loose   .path-card__verdict { color: var(--bad); }
+.path-card--right   .path-card__verdict { color: var(--good); }
+.path-card h3 {
+  margin-bottom: 0.85rem;
+}
+.path-card p {
+  color: var(--fg-dim);
+  font-size: 0.96rem;
+  max-width: none;
+  margin: 0;
+}
+.path-card--right {
+  border-color: var(--accent-soft);
+  background: linear-gradient(180deg, var(--bg-elev) 0%, var(--bg-elev-2) 100%);
+  box-shadow: 0 0 0 1px var(--accent-tint), 0 20px 40px -20px rgba(212, 160, 90, 0.15);
+}
+.path-card--right::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background:
+    linear-gradient(135deg, rgba(212, 160, 90, 0.06) 0%, transparent 40%);
+  pointer-events: none;
+}
+
+/* ─── how it works ─────────────────────────────────────────────────────── */
+.how { padding-top: clamp(3rem, 6vw, 5rem); }
+.how__intro { color: var(--fg-dim); margin-bottom: 2.5rem; }
+
+.flow {
+  margin: 0 0 3rem;
+  border: 1px solid var(--border);
+  background: var(--bg-elev);
+  padding: 1.5rem clamp(1rem, 3vw, 2rem);
+  overflow-x: auto;
+}
+.flow pre {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: clamp(0.7rem, 1.4vw, 0.86rem);
+  line-height: 1.4;
+  color: var(--fg-dim);
+  white-space: pre;
+}
+.flow .b { color: var(--fg); font-weight: 500; }
+.flow .a { color: var(--accent); font-weight: 500; }
+.flow .g { color: var(--good); }
+.flow .w { color: var(--warn); }
+.flow .r { color: var(--bad); }
+
+.examples-head {
+  margin: 2.5rem 0 1.25rem;
+}
+.examples {
+  display: grid;
+  gap: 0.5rem;
+}
+.example {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.75rem 1rem;
+  border: 1px solid var(--border);
+  background: var(--bg-elev);
+  font-family: var(--font-mono);
+  font-size: 0.92rem;
+}
+.example__score {
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  padding: 0.2rem 0.55rem;
+  border-radius: 2px;
+  font-size: 0.78rem;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+.example__cmd {
+  color: var(--fg);
+  word-break: break-all;
+}
+.example__cmd .arg { color: var(--fg-dim); }
+.example__verdict {
+  font-size: 0.72rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--fg-soft);
+  white-space: nowrap;
+}
+.example--allow .example__score {
+  background: rgba(138, 166, 111, 0.15);
+  color: var(--good);
+  border: 1px solid rgba(138, 166, 111, 0.3);
+}
+.example--ask .example__score {
+  background: rgba(212, 160, 90, 0.13);
+  color: var(--accent);
+  border: 1px solid rgba(212, 160, 90, 0.3);
+}
+.example--deny .example__score {
+  background: rgba(184, 88, 71, 0.13);
+  color: var(--bad);
+  border: 1px solid rgba(184, 88, 71, 0.3);
+}
+@media (max-width: 720px) {
+  .example {
+    grid-template-columns: auto 1fr;
+    grid-template-areas:
+      "score verdict"
+      "cmd cmd";
+    gap: 0.5rem 0.75rem;
+  }
+  .example__score   { grid-area: score; }
+  .example__verdict { grid-area: verdict; justify-self: end; }
+  .example__cmd     { grid-area: cmd; }
+}
+
+/* ─── features grid ────────────────────────────────────────────────────── */
+.features { border-top: 1px solid var(--border-soft); }
+.feature-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 1px;
+  margin-top: 3rem;
+  border: 1px solid var(--border);
+  background: var(--border);
+}
+@media (max-width: 920px) {
+  .feature-grid { grid-template-columns: repeat(2, 1fr); }
+}
+@media (max-width: 600px) {
+  .feature-grid { grid-template-columns: 1fr; }
+}
+.feature {
+  background: var(--bg);
+  padding: 1.75rem 1.5rem 1.75rem;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+  transition: background 0.2s ease;
+}
+.feature:hover { background: var(--bg-elev); }
+.feature__tag {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin-bottom: 1rem;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.feature__tag::before {
+  content: "//";
+  color: var(--fg-faint);
+  font-weight: 500;
+}
+.feature h3 {
+  margin-bottom: 0.65rem;
+  font-size: 1.15rem;
+  line-height: 1.25;
+  font-variation-settings: "opsz" 30, "wght" 600;
+}
+.feature p {
+  margin: 0;
+  color: var(--fg-dim);
+  font-size: 0.94rem;
+  max-width: none;
+}
+
+/* ─── install detailed ─────────────────────────────────────────────────── */
+.install-detailed {
+  border-top: 1px solid var(--border-soft);
+}
+.steps {
+  margin-top: 2.5rem;
+  display: grid;
+  gap: 2.5rem;
+}
+.step {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 1.5rem;
+  align-items: start;
+}
+@media (max-width: 720px) {
+  .step { grid-template-columns: 1fr; gap: 0.75rem; }
+}
+.step__num {
+  font-family: var(--font-display);
+  font-variation-settings: "opsz" 96, "wght" 400;
+  font-size: 3rem;
+  line-height: 0.9;
+  color: var(--accent);
+  font-feature-settings: "lnum";
+  font-variant-numeric: lining-nums;
+}
+.step__body { max-width: 60ch; }
+.step__body h3 {
+  font-family: var(--font-display);
+  font-variation-settings: "opsz" 48, "wght" 500;
+  font-size: 1.45rem;
+  font-style: italic;
+  margin-bottom: 0.75rem;
+  color: var(--fg);
+}
+.step__body p {
+  color: var(--fg-dim);
+  font-size: 0.98rem;
+  margin: 0 0 1rem;
+}
+.code-block {
+  margin: 0;
+  padding: 0.95rem 1rem;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+  line-height: 1.55;
+  color: var(--fg);
+  overflow-x: auto;
+}
+.code-block .c { color: var(--fg-soft); }
+.code-block .p { color: var(--accent); }
+
+/* ─── faq ──────────────────────────────────────────────────────────────── */
+.faq { border-top: 1px solid var(--border-soft); }
+.faq__list { margin-top: 2.5rem; border-top: 1px solid var(--border); }
+.faq details {
+  border-bottom: 1px solid var(--border);
+}
+.faq summary {
+  list-style: none;
+  cursor: pointer;
+  padding: 1.5rem 0.5rem 1.5rem 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  font-family: var(--font-display);
+  font-variation-settings: "opsz" 48, "wght" 500;
+  font-size: clamp(1.05rem, 2.2vw, 1.3rem);
+  color: var(--fg);
+  transition: color 0.15s ease;
+}
+.faq summary::-webkit-details-marker { display: none; }
+.faq summary:hover { color: var(--accent); }
+.faq summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 4px;
+}
+.faq summary::after {
+  content: "+";
+  font-family: var(--font-mono);
+  font-size: 1.5rem;
+  color: var(--fg-soft);
+  width: 1.5rem;
+  text-align: center;
+  transition: transform 0.2s ease, color 0.15s ease;
+}
+.faq details[open] summary::after {
+  content: "-";
+  color: var(--accent);
+}
+.faq details[open] summary { color: var(--fg); }
+.faq__answer {
+  padding: 0 2rem 1.75rem 0;
+  color: var(--fg-dim);
+  font-size: 1rem;
+  line-height: 1.6;
+  max-width: 65ch;
+}
+.faq__answer code {
+  font-size: 0.88em;
+  padding: 0.05em 0.35em;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  color: var(--fg);
+}
+
+/* ─── footer ───────────────────────────────────────────────────────────── */
+footer {
+  padding: 3rem var(--gutter) 4rem;
+  border-top: 1px solid var(--border-soft);
+  text-align: center;
+}
+footer .wordmark {
+  font-family: var(--font-display);
+  font-variation-settings: "opsz" 96, "wght" 500;
+  font-size: 1.4rem;
+  color: var(--fg);
+  margin: 0 0 0.5rem;
+}
+footer .wordmark .sep { color: var(--accent); }
+footer .repo {
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+}
+footer .credit {
+  margin-top: 1.5rem;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--fg-soft);
+  letter-spacing: 0.05em;
+}
+
+/* ─── section dividers ─────────────────────────────────────────────────── */
+.rule {
+  font-family: var(--font-mono);
+  color: var(--fg-faint);
+  margin: 0 0 2rem;
+  font-size: 0.75rem;
+  letter-spacing: 0.4em;
+  user-select: none;
+}
+
+/* ─── visually-hidden ──────────────────────────────────────────────────── */
+.visually-hidden {
+  position: absolute !important;
+  width: 1px; height: 1px;
+  padding: 0; margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ─── reduced motion ──────────────────────────────────────────────────── */
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; animation: none !important; }
+}
+
+/* ─── reveal animation on hero ────────────────────────────────────────── */
+@keyframes rise {
+  from { opacity: 0; transform: translateY(12px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.hero .brand,
+.hero .tagline,
+.hero .subhead,
+.hero .install-card,
+.hero .stats {
+  animation: rise 0.7s cubic-bezier(0.2, 0.7, 0.2, 1) both;
+}
+.hero .tagline      { animation-delay: 0.08s; }
+.hero .subhead      { animation-delay: 0.16s; }
+.hero .install-card { animation-delay: 0.24s; }
+.hero .stats        { animation-delay: 0.32s; }
+</style>
+</head>
+
+<body>
+
+<header class="statusbar" role="banner">
+  <span class="dots" aria-hidden="true">
+    <span class="dot red"></span>
+    <span class="dot amber"></span>
+    <span class="dot green"></span>
+  </span>
+  <span class="path">~/.claude/guard</span>
+  <span class="spacer"></span>
+  <span class="ver">v2.0</span>
+</header>
+
+<main>
+
+<!-- ─── HERO ───────────────────────────────────────────────────────────── -->
+<section class="hero" aria-labelledby="brand">
+  <div class="wrap">
+    <h1 class="brand" id="brand">claude<span class="sep" aria-hidden="true">-</span>guard</h1>
+    <p class="tagline">Lets Claude Code work. Stops it from wrecking your machine.</p>
+    <p class="subhead">A PreToolUse hook that scores every shell command on a 0 to 100 risk scale, silently allows the safe ones, asks on ambiguous ones, and blocks the obviously dangerous ones.</p>
+
+    <div class="install-card" role="region" aria-label="Installation command">
+      <div class="install-card__head">
+        <span class="install-card__label">install</span>
+        <div class="install-card__tabs" role="tablist" aria-label="Operating system">
+          <button class="install-card__tab" role="tab" aria-selected="true"  aria-controls="cmd-unix"    id="tab-unix"    data-target="cmd-unix">macOS / Linux</button>
+          <button class="install-card__tab" role="tab" aria-selected="false" aria-controls="cmd-windows" id="tab-windows" data-target="cmd-windows">Windows</button>
+        </div>
+      </div>
+      <div class="install-card__body">
+        <pre class="install-card__cmd" id="cmd-unix"    role="tabpanel" aria-labelledby="tab-unix"    data-active="true"><code><span class="prompt">$</span>git clone https://github.com/Gabriel-Dalton/claude-guard ~/.claude/guard &amp;&amp; python ~/.claude/guard/install.py</code></pre>
+        <pre class="install-card__cmd" id="cmd-windows" role="tabpanel" aria-labelledby="tab-windows"><code><span class="prompt">&gt;</span>git clone https://github.com/Gabriel-Dalton/claude-guard "$env:USERPROFILE\.claude\guard"; python "$env:USERPROFILE\.claude\guard\install.py"</code></pre>
+        <button class="install-card__copy" type="button" id="copy-btn" aria-label="Copy install command to clipboard">copy</button>
+      </div>
+      <p class="install-card__note">One line. The installer asks where to put it (global, fires for every project; or per-project), copies the files, wires the hook into your Claude Code settings.json. No telemetry. No daemon.</p>
+    </div>
+
+    <div class="stats" role="list">
+      <div class="stat" role="listitem">
+        <span class="stat__num is-mono">212,337</span>
+        <span class="stat__caption">malicious npm packages tracked</span>
+      </div>
+      <div class="stat" role="listitem">
+        <span class="stat__num is-mono">11,159</span>
+        <span class="stat__caption">malicious PyPI packages tracked</span>
+      </div>
+      <div class="stat" role="listitem">
+        <span class="stat__num is-mono">&lt; 1<span style="font-size:0.7em">ms</span></span>
+        <span class="stat__caption">per-command evaluation</span>
+      </div>
+      <div class="stat" role="listitem">
+        <span class="stat__num is-mono">0</span>
+        <span class="stat__caption">runtime dependencies</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ─── PROBLEM ────────────────────────────────────────────────────────── -->
+<section class="problem" aria-labelledby="problem-h">
+  <div class="wrap">
+    <p class="eyebrow">the problem</p>
+    <h2 id="problem-h">Three paths. <em>One of them is right.</em></h2>
+
+    <div class="three-paths">
+      <article class="path-card path-card--noisy">
+        <span class="path-card__verdict">option a / too noisy</span>
+        <h3>Default Claude Code</h3>
+        <p>Approves nothing without asking. You click through dozens of prompts a day for commands that are obviously fine. A normal <code>pwsh -DryRun</code> gets flagged as a "nested PowerShell process which cannot be validated." Your flow dies a death by a thousand confirmations.</p>
+      </article>
+
+      <article class="path-card path-card--loose">
+        <span class="path-card__verdict">option b / too loose</span>
+        <h3>--dangerously-skip-permissions</h3>
+        <p>Approves everything. Claude can install packages, modify files outside the project, talk to the network, and run things as you, all without asking. The noise is gone. So is the safety net.</p>
+      </article>
+
+      <article class="path-card path-card--right">
+        <span class="path-card__verdict">option c / claude-guard</span>
+        <h3>The middle path</h3>
+        <p>Silent on the boring stuff. Asks on ambiguous things, with a full risk breakdown. Hard-blocks supply-chain attacks, credential reads, force-pushes to <code>main</code>, and 200,000+ named-malicious packages. The judgement call you'd make if you reviewed every command yourself. Encoded.</p>
+      </article>
+    </div>
+  </div>
+</section>
+
+<!-- ─── HOW IT WORKS ───────────────────────────────────────────────────── -->
+<section class="how" aria-labelledby="how-h">
+  <div class="wrap">
+    <p class="eyebrow">how it works</p>
+    <h2 id="how-h">Score every command. Map to a decision.</h2>
+    <p class="how__intro">Before Claude runs a shell command, claude-guard sees it via the PreToolUse hook. Four signal types fire in parallel: pattern matches (regex on known dangerous shapes), path scope (where on the filesystem the command reaches), network targets (domain reputation, package registries), and contextual reducers (dry-run flags, read-only verbs). Anomaly detection adds a small overlay based on what's normal for this project. The total clamps to 0 to 100 and maps to one of three decisions.</p>
+
+    <figure class="flow" aria-label="Decision flow diagram">
+<pre><code><span class="b">┌──────────────────────────────────────────┐</span>
+<span class="b">│</span>  Claude proposes a Bash command          <span class="b">│</span>
+<span class="b">│</span>  <span class="c">PreToolUse hook payload via stdin</span>       <span class="b">│</span>
+<span class="b">└────────────────────┬─────────────────────┘</span>
+                     <span class="b">▼</span>
+<span class="b">┌──────────────────────────────────────────┐</span>
+<span class="b">│</span>  <span class="a">claude-guard scores</span>                     <span class="b">│</span>
+<span class="b">│</span>   pattern  +  path  +  network           <span class="b">│</span>
+<span class="b">│</span>     +  context  +  anomaly  +  veto      <span class="b">│</span>
+<span class="b">└────────────────────┬─────────────────────┘</span>
+                     <span class="b">▼</span>
+   <span class="g">0</span>  ───────  <span class="w">25</span>  ─────────────  <span class="r">60</span>  ──── <span class="b">100</span>
+   <span class="b">│</span>             <span class="b">│</span>               <span class="b">│</span>             <span class="b">│</span>
+   <span class="b">▼</span>             <span class="b">▼</span>               <span class="b">▼</span>
+<span class="b">┌─────────┐</span>   <span class="b">┌──────────┐</span>     <span class="b">┌──────────┐</span>
+<span class="b">│</span> <span class="g">ALLOW</span>   <span class="b">│</span>   <span class="b">│</span>   <span class="w">ASK</span>    <span class="b">│</span>     <span class="b">│</span>   <span class="r">DENY</span>   <span class="b">│</span>
+<span class="b">│</span> silent  <span class="b">│</span>   <span class="b">│</span> + breakdown <span class="b">│</span>    <span class="b">│</span> blocked  <span class="b">│</span>
+<span class="b">└─────────┘</span>   <span class="b">│</span> + LLM opt. <span class="b">│</span>     <span class="b">└──────────┘</span>
+              <span class="b">└──────────┘</span></code></pre>
+    </figure>
+
+    <h3 class="examples-head">Real examples, from the live test suite</h3>
+    <div class="examples">
+      <div class="example example--allow">
+        <span class="example__score">0/100</span>
+        <code class="example__cmd">git status</code>
+        <span class="example__verdict">allow / allowlist hit</span>
+      </div>
+      <div class="example example--allow">
+        <span class="example__score">0/100</span>
+        <code class="example__cmd">pip install <span class="arg">requests==2.31.0</span></code>
+        <span class="example__verdict">allow / pinned, not malicious</span>
+      </div>
+      <div class="example example--allow">
+        <span class="example__score">10/100</span>
+        <code class="example__cmd">git push --force origin <span class="arg">feature/foo</span></code>
+        <span class="example__verdict">allow / force push on a feature branch</span>
+      </div>
+      <div class="example example--ask">
+        <span class="example__score">25/100</span>
+        <code class="example__cmd">New-NetFirewallRule <span class="arg">-DisplayName foo -Direction Inbound</span></code>
+        <span class="example__verdict">ask / firewall rule modification</span>
+      </div>
+      <div class="example example--ask">
+        <span class="example__score">45/100</span>
+        <code class="example__cmd">cat <span class="arg">~/.ssh/id_rsa</span></code>
+        <span class="example__verdict">ask / ssh key read, out of project</span>
+      </div>
+      <div class="example example--deny">
+        <span class="example__score">60/100</span>
+        <code class="example__cmd">git push --force origin <span class="arg">main</span></code>
+        <span class="example__verdict">deny / force push to protected branch</span>
+      </div>
+      <div class="example example--deny">
+        <span class="example__score">80/100</span>
+        <code class="example__cmd">npm install <span class="arg">snes-game-names</span></code>
+        <span class="example__verdict">deny / real OSV MAL-* typosquat</span>
+      </div>
+      <div class="example example--deny">
+        <span class="example__score">100/100</span>
+        <code class="example__cmd">rm -rf <span class="arg">/</span></code>
+        <span class="example__verdict">deny / denylist match</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ─── FEATURES ───────────────────────────────────────────────────────── -->
+<section class="features" aria-labelledby="features-h">
+  <div class="wrap">
+    <p class="eyebrow">what's inside</p>
+    <h2 id="features-h">Six things that make it actually work.</h2>
+
+    <div class="feature-grid">
+      <article class="feature">
+        <span class="feature__tag">threat feed</span>
+        <h3>223,000+ malicious packages, auto-refreshed</h3>
+        <p>Live OSV.dev <code>MAL-*</code> advisories for npm and PyPI, pulled with a single script. Catches typosquats and supply-chain attacks the moment Claude tries to install one. Schedule it via cron or Task Scheduler; the hook reads the latest set on every invocation.</p>
+      </article>
+
+      <article class="feature">
+        <span class="feature__tag">llm second opinion</span>
+        <h3>Haiku 4.5 weighs in on the ambiguous middle</h3>
+        <p>Optional, requires <code>ANTHROPIC_API_KEY</code>. Ask-band commands get a 3 second LLM review with the full risk breakdown. High-confidence "allow" verdicts auto-apply. "Deny" verdicts annotate the human prompt with strong warnings, never block on the human's behalf.</p>
+      </article>
+
+      <article class="feature">
+        <span class="feature__tag">anomaly detection</span>
+        <h3>Per-project behavioural baselines</h3>
+        <p>Tracks which interpreters, domains, and directories are normal for each project. A first-time fetch to a never-seen domain adds points. Catches prompt-injection cases that static pattern rules can't see. Warmup is 50 commands; baseline updates only on allowed decisions.</p>
+      </article>
+
+      <article class="feature">
+        <span class="feature__tag">self-tuning</span>
+        <h3>Learns the commands you keep approving</h3>
+        <p>Run <code>tune.py review</code> after a week of real use. It reads your audit log, clusters the commands you keep getting prompted on, and promotes them to a silent-allow with one keypress. Writes to <code>rules_user.py</code> so upstream updates never clobber your tuning.</p>
+      </article>
+
+      <article class="feature">
+        <span class="feature__tag">audit log</span>
+        <h3>Every decision recorded as JSONL</h3>
+        <p>Per-command timing, signal breakdown, decision rationale, LLM verdict if it ran. Local file, append-only, no rotation. Pipe it through <code>jq</code>, feed it into your own dashboards, or just grep it. The audit log is the API; tune.py and anomaly both read from it.</p>
+      </article>
+
+      <article class="feature">
+        <span class="feature__tag">fail-closed</span>
+        <h3>If the hook breaks, you get prompted</h3>
+        <p>A syntax error in rules.py, a malformed audit file, a corrupted threat feed: none of these silently bypass Claude Code's permission system. The default failure mode is to ask the human, with an explanation of what went wrong. Configurable via <code>FAIL_MODE</code> in rules.py.</p>
+      </article>
+    </div>
+  </div>
+</section>
+
+<!-- ─── INSTALL DETAILED ───────────────────────────────────────────────── -->
+<section class="install-detailed" aria-labelledby="install-h">
+  <div class="wrap">
+    <p class="eyebrow">install</p>
+    <h2 id="install-h">Three steps. Or really, one.</h2>
+
+    <div class="steps">
+
+      <div class="step">
+        <span class="step__num" aria-hidden="true">01</span>
+        <div class="step__body">
+          <h3>Run the one line</h3>
+          <p>The installer asks if you want global (every Claude Code project on this machine, recommended for daily use) or per-project (just one folder). It copies the files, merges the hook into the right <code>settings.json</code>, and optionally fetches the malicious-package feed. Re-running it is idempotent.</p>
+
+          <h4>macOS / Linux</h4>
+          <pre class="code-block"><span class="p">$</span> git clone https://github.com/Gabriel-Dalton/claude-guard ~/.claude/guard <span class="c">\</span>
+    &amp;&amp; python ~/.claude/guard/install.py</pre>
+
+          <h4 style="margin-top:1.5rem">Windows (PowerShell)</h4>
+          <pre class="code-block"><span class="p">&gt;</span> git clone https://github.com/Gabriel-Dalton/claude-guard `
+    "<span class="c">$env:USERPROFILE</span>\.claude\guard"; <span class="c">`</span>
+  python "<span class="c">$env:USERPROFILE</span>\.claude\guard\install.py"</pre>
+        </div>
+      </div>
+
+      <div class="step">
+        <span class="step__num" aria-hidden="true">02</span>
+        <div class="step__body">
+          <h3>Optional: the LLM key</h3>
+          <p>For the Haiku 4.5 second opinion on ambiguous commands. claude-guard works without this; you just don't get the LLM review. If you set it, the hook calls api.anthropic.com only for commands in the ask band (score 25 to 59), with a 3 second hard timeout.</p>
+          <pre class="code-block"><span class="c"># bash / zsh</span>
+<span class="p">$</span> export ANTHROPIC_API_KEY=<span class="c">"sk-ant-..."</span>
+
+<span class="c"># PowerShell (persistent across sessions)</span>
+<span class="p">&gt;</span> setx ANTHROPIC_API_KEY <span class="c">"sk-ant-..."</span></pre>
+        </div>
+      </div>
+
+      <div class="step">
+        <span class="step__num" aria-hidden="true">03</span>
+        <div class="step__body">
+          <h3>Open a Claude Code session</h3>
+          <p>That's it. The hook fires on every Bash command Claude tries to run. The boring stuff goes through silently. Ambiguous stuff still asks. Dangerous stuff gets blocked. After a week, run <code>tune.py review</code> to cut down the asks even further.</p>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</section>
+
+<!-- ─── FAQ ────────────────────────────────────────────────────────────── -->
+<section class="faq" aria-labelledby="faq-h">
+  <div class="wrap">
+    <p class="eyebrow">questions you'll have</p>
+    <h2 id="faq-h">Things worth knowing.</h2>
+
+    <div class="faq__list">
+      <details>
+        <summary>Does it slow down Claude Code?</summary>
+        <div class="faq__answer">
+          <p>Per-command evaluation is sub-millisecond after pre-compile. Cold start (Python launch plus loading the threat feed) is around 350ms on a typical machine. The 95th percentile end-to-end stays under the 1 second budget we wrote into the spec, with plenty of margin.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>Does it phone home?</summary>
+        <div class="faq__answer">
+          <p>No. The hook itself makes zero network calls. The threat feed updater talks to OSV.dev on your schedule, when you run it. The LLM fallback talks to api.anthropic.com only if you opt in by setting <code>ANTHROPIC_API_KEY</code>. There is no telemetry, no usage reporting, no analytics, no nothing.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>What if claude-guard itself breaks?</summary>
+        <div class="faq__answer">
+          <p>Default fail-mode is "closed." If <code>rules.py</code> has a syntax error, or any unexpected exception fires during evaluation, the hook emits an explanatory "ask" decision so you get prompted. It never silently bypasses Claude Code's permission system. The behaviour is configurable in <code>rules.py</code> if you'd rather fail open.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>Can I tune it for my workflows?</summary>
+        <div class="faq__answer">
+          <p>Yes. After a week of real use, run <code>python tune.py review</code>. It clusters the ask-band commands you keep getting prompted on, suggests an allowlist regex for each cluster, and writes them to <code>rules_user.py</code> on your approval. The base <code>rules.py</code> is never modified; pulling updates from the repo stays clean.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>Do I need the LLM API key for it to work?</summary>
+        <div class="faq__answer">
+          <p>No. Everything works without it. The key only enables the optional Haiku 4.5 second-opinion on the ambiguous middle band. You get pattern, path, network, anomaly, and context scoring regardless. The LLM is a nice extra, not the core.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>How do I uninstall it?</summary>
+        <div class="faq__answer">
+          <p>Delete the install directory (<code>rm -rf ~/.claude/guard</code> for global, or <code>&lt;project&gt;/.claude/guard</code> for per-project), then remove the PreToolUse Bash hook entry from the matching settings.json. The installer prints the exact paths when it finishes, so you don't have to hunt for them.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>Is it Windows-friendly?</summary>
+        <div class="faq__answer">
+          <p>Yes. Designed and tested on Windows 11 with PowerShell as a first-class shell. Path normalisation treats <code>\</code> and <code>/</code> as equivalent. PowerShell-style commands get their own detection layer. The installer's settings.json merge handles both POSIX and Windows-style hook command paths.</p>
+        </div>
+      </details>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <p class="wordmark">claude<span class="sep" aria-hidden="true">-</span>guard</p>
+  <p class="repo"><a href="https://github.com/Gabriel-Dalton/claude-guard">github.com/Gabriel-Dalton/claude-guard</a></p>
+  <p class="credit">Built by Gabriel Dalton.</p>
+</footer>
+
+<script>
+(function () {
+  // Tab switching for the install card
+  var tabs = document.querySelectorAll(".install-card__tab");
+  tabs.forEach(function (tab) {
+    tab.addEventListener("click", function () {
+      var targetId = tab.dataset.target;
+      tabs.forEach(function (t) {
+        t.setAttribute("aria-selected", t === tab ? "true" : "false");
+      });
+      document.querySelectorAll(".install-card__cmd").forEach(function (cmd) {
+        cmd.dataset.active = (cmd.id === targetId) ? "true" : "false";
+      });
+    });
+    // Keyboard support (left/right arrows between tabs)
+    tab.addEventListener("keydown", function (e) {
+      if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+      e.preventDefault();
+      var list = Array.from(tabs);
+      var i = list.indexOf(tab);
+      var next = e.key === "ArrowRight"
+        ? list[(i + 1) % list.length]
+        : list[(i - 1 + list.length) % list.length];
+      next.focus();
+      next.click();
+    });
+  });
+
+  // Copy button
+  var copyBtn = document.getElementById("copy-btn");
+  if (copyBtn) {
+    copyBtn.addEventListener("click", function () {
+      var active = document.querySelector(".install-card__cmd[data-active='true'] code");
+      if (!active) return;
+      // strip the prompt span text
+      var text = "";
+      active.childNodes.forEach(function (node) {
+        if (node.nodeType === 3) {
+          text += node.textContent;
+        } else if (node.classList && !node.classList.contains("prompt")) {
+          text += node.textContent;
+        }
+      });
+      text = text.replace(/^\s+/, "");
+      var done = function () {
+        copyBtn.dataset.copied = "true";
+        copyBtn.textContent = "copied";
+        setTimeout(function () {
+          copyBtn.dataset.copied = "false";
+          copyBtn.textContent = "copy";
+        }, 1800);
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(done, function () {
+          // Fallback for older browsers
+          var ta = document.createElement("textarea");
+          ta.value = text; document.body.appendChild(ta);
+          ta.select(); try { document.execCommand("copy"); } catch (e) {}
+          document.body.removeChild(ta);
+          done();
+        });
+      } else {
+        var ta = document.createElement("textarea");
+        ta.value = text; document.body.appendChild(ta);
+        ta.select(); try { document.execCommand("copy"); } catch (e) {}
+        document.body.removeChild(ta);
+        done();
+      }
+    });
+  }
+})();
+</script>
+
+</body>
+</html>
