@@ -14,7 +14,14 @@
       "Bash(where py *)",
       "Bash(where python3 *)",
       "Bash(py --version)",
-      "Bash(python3 --version)"
+      "Bash(python3 --version)",
+      "PowerShell(Get-ChildItem *)",
+      "PowerShell($p = \"$env:USERPROFILE\\\\.claude\\\\statusline-tokens.ps1\"; $b = [System.IO.File]::ReadAllBytes\\($p\\); $emDash = [byte[]]\\(0xE2, 0x80, 0x94\\); $hits = @\\(\\); for \\($i = 0; $i -lt $b.Length - 2; $i++\\) { if \\($b[$i] -eq 0xE2 -and $b[$i+1] -eq 0x80 -and $b[$i+2] -eq 0x94\\) { $hits += $i } }; \"UTF-8 em-dash byte sequences found at offsets: $\\($hits -join ', '\\)\"; \"Total: $\\($hits.Count\\)\")",
+      "Bash(python *)",
+      "Bash($PY *)",
+      "Bash(/c/Users/Gabriel-Dalton/AppData/Local/Programs/Python/Python312/python.exe C:/Users/Gabriel-Dalton/Documents/GitHub/claude-guard/claude-guard.py --test)",
+      "Bash(cp C:/Users/Gabriel-Dalton/Documents/GitHub/claude-guard/claude-guard.py C:/Users/Gabriel-Dalton/.claude/guard/claude-guard.py)",
+      "Bash(cp C:/Users/Gabriel-Dalton/Documents/GitHub/claude-guard/rules.py C:/Users/Gabriel-Dalton/.claude/guard/rules.py)"
     ]
   }
 }

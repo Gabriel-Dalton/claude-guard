@@ -185,9 +185,19 @@ def load_settings(path: Path) -> tuple[dict, bool]:
         sys.exit(2)
 
 
+GUARD_MATCHER = "Bash|Edit|Write|MultiEdit|WebFetch|WebSearch|mcp__.*"
+GUARD_TIMEOUT = 10
+
+
 def merge_hook(settings: dict, hook_command: str) -> bool:
     """Returns True if we modified settings, False if our hook was already
-    present."""
+    present and correct.
+
+    Strategy: find any existing PreToolUse entry that already runs
+    claude-guard.py (regardless of its matcher field — V2 installs used
+    "Bash" only) and rewrite it to the V3 broad matcher. If none exists,
+    create a fresh entry.
+    """
     settings.setdefault("hooks", {})
     if not isinstance(settings["hooks"], dict):
         settings["hooks"] = {}
@@ -196,40 +206,50 @@ def merge_hook(settings: dict, hook_command: str) -> bool:
         pre = []
         settings["hooks"]["PreToolUse"] = pre
 
-    # Look for an existing Bash matcher; only one hook per matcher is supported
-    # cleanly by Claude Code.
-    bash_matcher = None
-    for entry in pre:
-        if (
-            isinstance(entry, dict)
-            and entry.get("matcher") == "Bash"
-            and isinstance(entry.get("hooks"), list)
-        ):
-            bash_matcher = entry
-            break
-
     new_hook = {
         "type": "command",
         "command": hook_command,
-        "timeout": 5,
+        "timeout": GUARD_TIMEOUT,
     }
 
-    if bash_matcher is None:
-        pre.append({"matcher": "Bash", "hooks": [new_hook]})
+    # Find an existing entry that already runs claude-guard, no matter what
+    # matcher it currently uses. This catches V2 installs (matcher: "Bash").
+    guard_entry = None
+    for entry in pre:
+        if (
+            isinstance(entry, dict)
+            and isinstance(entry.get("hooks"), list)
+            and any(
+                isinstance(h, dict)
+                and isinstance(h.get("command"), str)
+                and "claude-guard.py" in h["command"]
+                for h in entry["hooks"]
+            )
+        ):
+            guard_entry = entry
+            break
+
+    if guard_entry is None:
+        pre.append({"matcher": GUARD_MATCHER, "hooks": [new_hook]})
         return True
 
-    # Replace any existing claude-guard hook; append otherwise.
-    hooks_list = bash_matcher["hooks"]
+    changed = False
+    if guard_entry.get("matcher") != GUARD_MATCHER:
+        guard_entry["matcher"] = GUARD_MATCHER
+        changed = True
+
+    # Replace the claude-guard hook in place; leave any unrelated hooks alone.
+    hooks_list = guard_entry["hooks"]
     for i, h in enumerate(hooks_list):
         if (
             isinstance(h, dict)
             and isinstance(h.get("command"), str)
             and "claude-guard.py" in h["command"]
         ):
-            if h.get("command") == hook_command and h.get("timeout") == 5:
-                return False  # already correct, no change
-            hooks_list[i] = new_hook
-            return True
+            if h.get("command") != hook_command or h.get("timeout") != GUARD_TIMEOUT:
+                hooks_list[i] = new_hook
+                changed = True
+            return changed
     hooks_list.append(new_hook)
     return True
 

@@ -62,6 +62,11 @@ try:
         ALLOWLIST_COMPILED,
         VETO_PATTERNS_COMPILED,
         FAIL_MODE,
+        DOMAINS,
+        FILE_PATH_DENYLIST_COMPILED,
+        FILE_PATH_SENSITIVE_PATTERNS,
+        MCP_READONLY_COMPILED,
+        MCP_HIGH_RISK_COMPILED,
     )
 except Exception as _e:  # ImportError, SyntaxError, NameError, etc.
     _RULES_LOAD_ERROR = (
@@ -71,6 +76,11 @@ except Exception as _e:  # ImportError, SyntaxError, NameError, etc.
     PATTERN_RULES = PATH_RULES = NETWORK_RULES = CONTEXT_REDUCERS = []
     THRESHOLDS = {"allow_below": 25, "deny_at_or_above": 60}
     DENYLIST_COMPILED = ALLOWLIST_COMPILED = VETO_PATTERNS_COMPILED = []
+    DOMAINS = {"trusted": set(), "watched": set(), "denied": set()}
+    FILE_PATH_DENYLIST_COMPILED = []
+    FILE_PATH_SENSITIVE_PATTERNS = []
+    MCP_READONLY_COMPILED = []
+    MCP_HIGH_RISK_COMPILED = []
     FAIL_MODE = _FAIL_MODE_DEFAULT
 
 
@@ -403,6 +413,187 @@ def evaluate(ctx: Context):
 
 
 # ============================================================================
+# Per-tool evaluators (V3.0)
+# ============================================================================
+# Each returns (score, signals, hard_allow, hard_deny, ctx) using the same
+# shape as evaluate() so downstream emit/log/anomaly machinery is unchanged.
+
+_HTTP_URL_RE = re.compile(r"https?://([^/\s\"'`)]+)", re.I)
+
+
+def _normalize_for_match(path_str: str) -> str:
+    """Forward-slash normalised, expanduser/expandvars expanded. Used to
+    match against FILE_PATH_DENYLIST and FILE_PATH_SENSITIVE_PATTERNS."""
+    try:
+        expanded = os.path.expandvars(os.path.expanduser(path_str))
+    except (ValueError, OSError):
+        expanded = path_str
+    return expanded.replace("\\", "/")
+
+
+def _synthesize_ctx(tool_name: str, summary: str, project_dir: Path,
+                    paths=None, out_of_scope=None, network_targets=None) -> Context:
+    return Context(
+        command=summary,
+        tool_name=tool_name,
+        project_dir=project_dir,
+        paths=paths or [],
+        out_of_scope_paths=out_of_scope or [],
+        network_targets=network_targets or [],
+    )
+
+
+def evaluate_edit(tool_name: str, tool_input: dict, project_dir: Path):
+    """Score Edit / Write / MultiEdit calls.
+
+    Decisions:
+      - Path matches FILE_PATH_DENYLIST (system paths)  -> hard deny.
+      - Path under project, no sensitive pattern        -> hard allow (score 0).
+      - Otherwise sum sensitive-pattern + out-of-scope signals.
+    """
+    raw_path = (tool_input.get("file_path") or "").strip()
+    if not raw_path:
+        # Defensive: malformed payload. Let Claude Code's native prompt take it.
+        ctx = _synthesize_ctx(tool_name, f"{tool_name}:<missing file_path>", project_dir)
+        return 0, [Signal("missing_file_path", 0, "Hook received no file_path; falling through")], False, False, ctx
+
+    norm = _normalize_for_match(raw_path)
+    summary = f"{tool_name}:{raw_path}"
+
+    # Hard deny: system paths.
+    for cp in FILE_PATH_DENYLIST_COMPILED:
+        if cp.search(norm):
+            sig = Signal("file_path_denylist", 100,
+                         f"Path matches system-path denylist: {cp.pattern}")
+            ctx = _synthesize_ctx(tool_name, summary, project_dir, paths=[Path(raw_path)])
+            return 100, [sig], False, True, ctx
+
+    signals = []
+    score = 0
+
+    # Sensitive-file patterns. Match against the forward-slash basename + tail
+    # so .env at the project root and ~/.ssh/id_rsa both hit.
+    for rule in FILE_PATH_SENSITIVE_PATTERNS:
+        compiled = rule.get("compiled")
+        if compiled is None:
+            continue
+        if compiled.search(norm):
+            signals.append(Signal(rule["name"], rule["points"], rule["reason"]))
+            score += rule["points"]
+
+    # In-scope check.
+    try:
+        path_obj = Path(os.path.expandvars(os.path.expanduser(raw_path)))
+    except (ValueError, OSError):
+        path_obj = Path(raw_path)
+
+    in_scope = is_within(path_obj, project_dir)
+    out_of_scope = []
+    if not in_scope:
+        out_of_scope.append(path_obj)
+        signals.append(Signal(
+            "writes_outside_project", 25,
+            f"Target path lives outside $CLAUDE_PROJECT_DIR ({project_dir})",
+        ))
+        score += 25
+
+    # Symlink escape: lexical in-scope but resolves outside.
+    escapes = resolve_escapes([path_obj], project_dir)
+    if escapes:
+        signals.append(Signal(
+            "symlink_escape", 40,
+            f"Path resolves through a symlink to: {escapes[0]}",
+        ))
+        score += 40
+
+    ctx = _synthesize_ctx(
+        tool_name, summary, project_dir,
+        paths=[path_obj], out_of_scope=out_of_scope,
+    )
+
+    # Clean in-project edit with no sensitive signals: hard-allow.
+    if not signals and in_scope and not escapes:
+        signals.append(Signal(
+            "in_project_edit", 0,
+            "File lives inside $CLAUDE_PROJECT_DIR and matches no sensitive pattern",
+        ))
+        return 0, signals, True, False, ctx
+
+    score = max(0, min(100, score))
+    return score, signals, False, False, ctx
+
+
+def evaluate_web(tool_name: str, tool_input: dict, project_dir: Path):
+    """Score WebFetch / WebSearch.
+
+    WebSearch is read-only (just a query) and always allows.
+    WebFetch is scored on domain reputation.
+    """
+    if tool_name == "WebSearch":
+        query = (tool_input.get("query") or "")[:120]
+        summary = f"WebSearch:{query}"
+        ctx = _synthesize_ctx(tool_name, summary, project_dir)
+        return 0, [Signal("web_search", 0, "WebSearch is read-only")], True, False, ctx
+
+    # WebFetch
+    url = (tool_input.get("url") or "").strip()
+    summary = f"WebFetch:{url}"
+    if not url:
+        ctx = _synthesize_ctx(tool_name, summary, project_dir)
+        return 0, [Signal("missing_url", 0, "Hook received no URL; falling through")], False, False, ctx
+
+    m = _HTTP_URL_RE.match(url)
+    domain = m.group(1).lower() if m else url.lower()
+    # Strip port if present.
+    domain_no_port = domain.split(":", 1)[0]
+
+    ctx = _synthesize_ctx(tool_name, summary, project_dir, network_targets=[domain_no_port])
+
+    if domain_no_port in DOMAINS.get("denied", set()):
+        sig = Signal("web_denied_domain", 100, f"Domain on deny list: {domain_no_port}")
+        return 100, [sig], False, True, ctx
+
+    if domain_no_port in DOMAINS.get("trusted", set()):
+        sig = Signal("web_trusted_domain", 0, f"Trusted dev-infra domain: {domain_no_port}")
+        return 0, [sig], True, False, ctx
+
+    if domain_no_port in DOMAINS.get("watched", set()):
+        sig = Signal("web_watched_domain", 35,
+                     f"Domain is a URL shortener / pastebin (hides destination): {domain_no_port}")
+        return 35, [sig], False, False, ctx
+
+    sig = Signal("web_unknown_domain", 10,
+                 f"Unknown domain (read-only fetch, low risk): {domain_no_port}")
+    return 10, [sig], False, False, ctx
+
+
+def evaluate_mcp(tool_name: str, tool_input: dict, project_dir: Path):
+    """Score MCP tool calls by tool-name pattern.
+
+    Read-only patterns auto-allow. Known write/action patterns push to ask.
+    Anything else falls in the ask band by default.
+    """
+    summary = f"{tool_name}:{json.dumps(tool_input)[:160]}"
+    ctx = _synthesize_ctx(tool_name, summary, project_dir)
+
+    for cp in MCP_READONLY_COMPILED:
+        if cp.search(tool_name):
+            sig = Signal("mcp_readonly", 0,
+                         f"MCP tool matches read-only pattern: {cp.pattern}")
+            return 0, [sig], True, False, ctx
+
+    for cp in MCP_HIGH_RISK_COMPILED:
+        if cp.search(tool_name):
+            sig = Signal("mcp_write_action", 35,
+                         f"MCP tool writes / acts on an external system: {cp.pattern}")
+            return 35, [sig], False, False, ctx
+
+    sig = Signal("mcp_unclassified", 25,
+                 f"MCP tool not on the read-only allowlist; defaulting to ask")
+    return 25, [sig], False, False, ctx
+
+
+# ============================================================================
 # Decision and output
 # ============================================================================
 
@@ -527,26 +718,43 @@ def _main_inner():
 
     tool_name = payload.get("tool_name", "")
     tool_input = payload.get("tool_input", {}) or {}
-
-    if tool_name != "Bash":
-        sys.exit(0)
-
-    command = (tool_input.get("command") or "").strip()
-    if not command:
-        sys.exit(0)
-
     project_dir = Path(os.environ.get("CLAUDE_PROJECT_DIR", os.getcwd()))
 
     t0 = time.perf_counter()
-    ctx = parse(command, tool_name, project_dir)
-    t1 = time.perf_counter()
-    score, signals, hard_allow, hard_deny = evaluate(ctx)
+
+    if tool_name == "Bash":
+        command = (tool_input.get("command") or "").strip()
+        if not command:
+            sys.exit(0)
+        ctx = parse(command, tool_name, project_dir)
+        t1 = time.perf_counter()
+        score, signals, hard_allow, hard_deny = evaluate(ctx)
+    elif tool_name in ("Edit", "Write", "MultiEdit"):
+        score, signals, hard_allow, hard_deny, ctx = evaluate_edit(
+            tool_name, tool_input, project_dir
+        )
+        t1 = time.perf_counter()
+    elif tool_name in ("WebFetch", "WebSearch"):
+        score, signals, hard_allow, hard_deny, ctx = evaluate_web(
+            tool_name, tool_input, project_dir
+        )
+        t1 = time.perf_counter()
+    elif tool_name.startswith("mcp__"):
+        score, signals, hard_allow, hard_deny, ctx = evaluate_mcp(
+            tool_name, tool_input, project_dir
+        )
+        t1 = time.perf_counter()
+    else:
+        # Tool not covered by claude-guard. Stay silent, let Claude Code use
+        # its native permission system.
+        sys.exit(0)
 
     # Load the baseline regardless of decision so we can update it later on
     # any allow (including hard-allow). Anomaly scoring only contributes for
     # the soft-scoring path so it cannot flip a hard allow into ask.
+    # Anomaly + LLM are Bash-only (the baseline is keyed on shell commands).
     baseline = None
-    if _anomaly_mod is not None:
+    if tool_name == "Bash" and _anomaly_mod is not None:
         try:
             baseline = _anomaly_mod.load(project_dir)
         except Exception:
@@ -573,6 +781,7 @@ def _main_inner():
     llm_verdict = None
     if (
         decision == "ask"
+        and tool_name == "Bash"
         and _llm_mod is not None
         and not (hard_allow or hard_deny)
     ):
@@ -614,7 +823,8 @@ def _main_inner():
 
     # Baseline updates only on allowed commands. Hard-allow counts too.
     if (
-        _anomaly_mod is not None
+        tool_name == "Bash"
+        and _anomaly_mod is not None
         and baseline is not None
         and decision == "allow"
     ):

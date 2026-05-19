@@ -779,7 +779,94 @@ except Exception:
 
 
 # ============================================================================
-# 12. PRE-COMPILED PATTERNS (V2.5)
+# 12. PER-TOOL RULES (V3.0)
+# ============================================================================
+# These data structures parallel the Bash rules above but apply to other
+# Claude Code tools. The dispatcher in claude-guard.py routes each tool to the
+# right rule set.
+
+# File-path denylist: paths that should NEVER be written/edited. Match against
+# the resolved absolute path string. Case-insensitive.
+FILE_PATH_DENYLIST = [
+    # POSIX system paths
+    r"^/etc/(?:passwd|shadow|sudoers|hosts|fstab|ssh/sshd_config)\b",
+    r"^/(?:bin|sbin|usr/bin|usr/sbin|boot|System)/",
+    r"^/Library/LaunchDaemons/",
+    r"^~?/Library/LaunchAgents/",
+
+    # Windows system paths (forward-slash normalized)
+    r"^[A-Za-z]:/Windows/(?:System32|SysWOW64|WinSxS)/",
+    r"^[A-Za-z]:/Program Files(?: \(x86\))?/Windows ",
+    r"^[A-Za-z]:/Windows/System32/drivers/etc/hosts",
+]
+
+# Sensitive file patterns: writing/editing these is high-risk regardless of
+# where they live. Match against the file's basename or trailing path segment.
+FILE_PATH_SENSITIVE_PATTERNS = [
+    # Credentials and keys
+    {"name": "ssh_key",          "pattern": r"\.ssh[/\\](?:id_[a-z0-9]+|authorized_keys|known_hosts|config)$",
+     "points": 70, "reason": "Modifying SSH key or config"},
+    {"name": "aws_creds",        "pattern": r"\.aws[/\\](?:credentials|config)$",
+     "points": 70, "reason": "Modifying AWS credentials"},
+    {"name": "gcloud_creds",     "pattern": r"\.config[/\\]gcloud[/\\]",
+     "points": 60, "reason": "Modifying gcloud auth state"},
+    {"name": "dotenv",           "pattern": r"(?:^|[/\\])\.env(?:\.[\w-]+)?$",
+     "points": 30, "reason": "Modifying .env file (likely contains secrets)"},
+    {"name": "private_key_file", "pattern": r"\.(?:pem|key|p12|pfx|jks)$",
+     "points": 60, "reason": "Modifying a private-key file"},
+    {"name": "git_credentials",  "pattern": r"\.git-credentials$|\.netrc$|\.npmrc$|\.pypirc$",
+     "points": 40, "reason": "Modifying stored credential file"},
+
+    # CI/CD and dependency manifests — medium signal (allowed in-project, but
+    # called out so combinations push toward ask).
+    {"name": "ci_workflow",      "pattern": r"(?:^|[/\\])\.github[/\\]workflows[/\\][^/\\]+\.ya?ml$",
+     "points": 10, "reason": "Modifying GitHub Actions workflow"},
+    {"name": "ci_other",         "pattern": r"(?:^|[/\\])\.(?:gitlab-ci|circleci|drone|travis)\.ya?ml$",
+     "points": 10, "reason": "Modifying CI configuration"},
+    {"name": "dep_manifest",     "pattern": r"(?:^|[/\\])(?:package\.json|package-lock\.json|yarn\.lock|pnpm-lock\.yaml|requirements\.txt|Pipfile|poetry\.lock|Cargo\.toml|Cargo\.lock|go\.mod|go\.sum)$",
+     "points": 5,  "reason": "Modifying a dependency manifest"},
+
+    # Shell profile rewrites — visible to every future shell.
+    {"name": "shell_profile",    "pattern": r"(?:^|[/\\])\.(?:bashrc|zshrc|bash_profile|zprofile|profile)$|[/\\]PowerShell[/\\]Microsoft\.PowerShell_profile\.ps1$",
+     "points": 50, "reason": "Modifying shell startup profile"},
+]
+
+# Read-only / safe MCP tool name patterns. Matched against the full tool_name
+# (e.g. "mcp__claude_ai_Linear__authenticate"). Server names can contain single
+# underscores, so the server segment is matched non-greedily up to `__`.
+# Anything matching auto-allows.
+MCP_READONLY_PATTERNS = [
+    r"^mcp__.+?__get_",
+    r"^mcp__.+?__list_",
+    r"^mcp__.+?__search_",
+    r"^mcp__.+?__read_",
+    r"^mcp__.+?__whoami$",
+    r"^mcp__.+?__authenticate$",
+    r"^mcp__.+?__complete_authentication$",
+    # Playwright observation-only operations
+    r"^mcp__playwright__browser_(?:snapshot|take_screenshot|console_messages|network_requests?|wait_for|tabs)$",
+    # Figma read operations
+    r"^mcp__claude_ai_Figma__(?:get_|search_|use_figma$|whoami$)",
+    # IDE diagnostics
+    r"^mcp__ide__getDiagnostics$",
+]
+
+# MCP tool name patterns considered higher-risk: writes data to an external
+# system, sends a message, uploads, executes code. These force ask.
+MCP_HIGH_RISK_PATTERNS = [
+    r"^mcp__.+?__(?:send_|post_|delete_|remove_|upload_|create_|update_)",
+    r"^mcp__playwright__browser_(?:click|drag|drop|type|press_key|fill_form|select_option|file_upload|navigate(?:_back)?|evaluate|run_code_unsafe|handle_dialog|hover|resize|close)$",
+    r"^mcp__ide__executeCode$",
+    r"^mcp__claude_ai_Figma__(?:create_new_file|upload_assets|use_figma$|send_code_connect_mappings|add_code_connect_map)$",
+]
+
+# Domains we proactively block for WebFetch (in addition to anything caught by
+# the watched list). Empty by default — populate from incident data.
+DOMAINS["denied"] = set()
+
+
+# ============================================================================
+# 13. PRE-COMPILED PATTERNS (V2.5)
 # ============================================================================
 # Module-level compiled regex for hot paths. Python's re module caches up to
 # 512 compiled patterns automatically, but explicit compilation makes the
@@ -788,6 +875,21 @@ except Exception:
 DENYLIST_COMPILED = [re.compile(p, re.I) for p in DENYLIST]
 ALLOWLIST_COMPILED = [re.compile(p, re.I) for p in ALLOWLIST]
 VETO_PATTERNS_COMPILED = [re.compile(p, re.I) for p in VETO_PATTERNS]
+
+FILE_PATH_DENYLIST_COMPILED = [re.compile(p, re.I) for p in FILE_PATH_DENYLIST]
+MCP_READONLY_COMPILED = [re.compile(p, re.I) for p in MCP_READONLY_PATTERNS]
+MCP_HIGH_RISK_COMPILED = [re.compile(p, re.I) for p in MCP_HIGH_RISK_PATTERNS]
+
+for _r in FILE_PATH_SENSITIVE_PATTERNS:
+    if "pattern" in _r and "compiled" not in _r:
+        try:
+            _r["compiled"] = re.compile(_r["pattern"], re.I)
+        except re.error:
+            _r["compiled"] = None
+try:
+    del _r
+except NameError:
+    pass
 
 for _r in PATTERN_RULES:
     if "pattern" in _r and "compiled" not in _r:
