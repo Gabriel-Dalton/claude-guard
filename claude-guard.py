@@ -688,6 +688,12 @@ def _fail_ask(message: str):
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "--test":
         run_self_test()
+        # Exit non-zero if rules.py failed to import so this command is usable
+        # as a verification step (e.g. from install.py or CI). The fixtures
+        # themselves are intentionally not graded — they're for human reading
+        # — so the only failure signal is a broken rules module.
+        if _RULES_LOAD_ERROR is not None:
+            sys.exit(1)
         return
 
     if _RULES_LOAD_ERROR is not None:

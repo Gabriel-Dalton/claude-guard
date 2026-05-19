@@ -1427,6 +1427,14 @@ def _pid_file_for(log_path: Path) -> Path:
     return log_path.parent / "dashboard.pid"
 
 
+def _port_file_for(log_path: Path) -> Path:
+    """Sibling of dashboard.pid. Stores the port the dashboard actually bound
+    to, which may differ from DEFAULT_PORT if it was already in use on first
+    launch. Lets a later `--ensure-running` recognise its own running child.
+    """
+    return log_path.parent / "dashboard.port"
+
+
 def _read_pid(pid_file: Path) -> int | None:
     try:
         return int(pid_file.read_text(encoding="utf-8").strip())
@@ -1510,34 +1518,122 @@ def _spawn_detached(args: list[str]) -> subprocess.Popen | None:
         return None
 
 
+PORT_FALLBACK_RANGE = 5  # if DEFAULT_PORT is taken, try DEFAULT_PORT..+RANGE
+
+
+def _read_port_file(port_file: Path) -> int | None:
+    try:
+        return int(port_file.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+
+
+def stop_running(log_path: Path) -> tuple[str, str]:
+    """Stop a dashboard child started by ensure_running. Returns (status,
+    message). status is one of: stopped, not-running, failed.
+
+    Used by `install.py --update` and called by users between source changes
+    so the next ensure_running starts a fresh child. Best-effort: removes the
+    PID and port files even if the kill signal couldn't reach the process.
+    """
+    pid_file = _pid_file_for(log_path)
+    port_file = _port_file_for(log_path)
+    pid = _read_pid(pid_file)
+    if not pid or not _pid_alive(pid):
+        for stale in (pid_file, port_file):
+            if stale.exists():
+                try:
+                    stale.unlink()
+                except OSError:
+                    pass
+        return "not-running", "no live dashboard process found"
+
+    if os.name == "nt":
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            PROCESS_TERMINATE = 0x0001
+            handle = kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
+            if not handle:
+                return "failed", f"could not open pid {pid} for termination"
+            try:
+                kernel32.TerminateProcess(handle, 1)
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception as e:
+            return "failed", f"terminate failed: {e}"
+    else:
+        try:
+            os.kill(pid, 15)  # SIGTERM
+        except ProcessLookupError:
+            pass
+        except OSError as e:
+            return "failed", f"kill failed: {e}"
+
+    # Wait up to 2s for the process to exit so a follow-up ensure-running
+    # doesn't race against the dying child.
+    for _ in range(20):
+        if not _pid_alive(pid):
+            break
+        time.sleep(0.1)
+    for stale in (pid_file, port_file):
+        if stale.exists():
+            try:
+                stale.unlink()
+            except OSError:
+                pass
+    return "stopped", f"dashboard (pid {pid}) stopped"
+
+
 def ensure_running(port: int, log_path: Path) -> tuple[str, str]:
     """Idempotently start the dashboard. Returns (status, message).
 
     status is one of:
       already-running, started, port-taken, failed.
+
+    If the requested port is held by another process (not our own previous
+    dashboard), walk forward through PORT_FALLBACK_RANGE-1 successor ports
+    before giving up. The chosen port is written to dashboard.port so a later
+    --ensure-running call can recognise it as our child.
     """
     pid_file = _pid_file_for(log_path)
-    url = f"http://127.0.0.1:{port}"
+    port_file = _port_file_for(log_path)
 
-    existing = _read_pid(pid_file)
-    if existing and _pid_alive(existing) and _port_listening(port):
-        return "already-running", f"dashboard already running (pid {existing}) at {url}"
+    # Recognise our own already-running child, even if it landed on a
+    # fallback port.
+    existing_pid = _read_pid(pid_file)
+    existing_port = _read_port_file(port_file) or port
+    if (
+        existing_pid
+        and _pid_alive(existing_pid)
+        and _port_listening(existing_port)
+    ):
+        url = f"http://127.0.0.1:{existing_port}"
+        return "already-running", f"dashboard already running (pid {existing_pid}) at {url}"
 
-    if _port_listening(port):
-        # Something else owns the port. Don't fight it.
-        return "port-taken", f"port {port} is in use by another process; dashboard not started"
+    # Clean up stale PID file before we try to spawn.
+    for stale in (pid_file, port_file):
+        if stale.exists():
+            try:
+                stale.unlink()
+            except OSError:
+                pass
 
-    # Clean up stale PID file.
-    if pid_file.exists():
-        try:
-            pid_file.unlink()
-        except OSError:
-            pass
+    # Walk forward through candidate ports until we find one that's free.
+    chosen_port = None
+    for candidate in range(port, port + PORT_FALLBACK_RANGE):
+        if not _port_listening(candidate):
+            chosen_port = candidate
+            break
+    if chosen_port is None:
+        return ("port-taken",
+                f"ports {port}-{port + PORT_FALLBACK_RANGE - 1} are all in "
+                "use; dashboard not started")
 
     here = Path(__file__).resolve()
     cmd = [
         sys.executable, str(here),
-        "--port", str(port),
+        "--port", str(chosen_port),
         "--log", str(log_path),
     ]
     proc = _spawn_detached(cmd)
@@ -1546,12 +1642,15 @@ def ensure_running(port: int, log_path: Path) -> tuple[str, str]:
 
     # Wait up to 3s for the child to bind.
     for _ in range(30):
-        if _port_listening(port):
+        if _port_listening(chosen_port):
             try:
                 pid_file.write_text(str(proc.pid), encoding="utf-8")
+                port_file.write_text(str(chosen_port), encoding="utf-8")
             except OSError:
                 pass
-            return "started", f"dashboard started (pid {proc.pid}) at {url}"
+            url = f"http://127.0.0.1:{chosen_port}"
+            note = "" if chosen_port == port else f" (fallback from {port})"
+            return "started", f"dashboard started (pid {proc.pid}) at {url}{note}"
         if proc.poll() is not None:
             return "failed", f"dashboard exited immediately (code {proc.returncode})"
         time.sleep(0.1)
@@ -1577,6 +1676,11 @@ def main() -> int:
                         "and exit immediately. Wired in from Claude Code's "
                         "SessionStart hook so the dashboard is always available."
                     ))
+    ap.add_argument("--stop", action="store_true",
+                    help=("stop the dashboard child started by --ensure-running "
+                          "(reads dashboard.pid). Used by `install.py --update` "
+                          "so re-copied files aren't held open by the previous "
+                          "process."))
     args = ap.parse_args()
 
     here = Path(__file__).resolve().parent
@@ -1584,6 +1688,11 @@ def main() -> int:
         Path(args.log).expanduser().resolve()
         if args.log else here / "audit.jsonl"
     )
+
+    if args.stop:
+        status, msg = stop_running(log_path)
+        print(msg)
+        return 0 if status in ("stopped", "not-running") else 1
 
     if args.ensure_running:
         status, msg = ensure_running(args.port, log_path)
@@ -1623,12 +1732,19 @@ def main() -> int:
         print("\nstopping…")
     finally:
         server.server_close()
-        # Best-effort PID file cleanup so the next ensure-running starts fresh.
+        # Best-effort PID + port file cleanup so the next ensure-running
+        # starts fresh.
         try:
             pf = _pid_file_for(log_path)
             existing = _read_pid(pf)
             if existing == os.getpid():
                 pf.unlink()
+        except OSError:
+            pass
+        try:
+            portf = _port_file_for(log_path)
+            if portf.exists():
+                portf.unlink()
         except OSError:
             pass
     return 0

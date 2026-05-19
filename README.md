@@ -65,7 +65,7 @@ Run the self-test from anywhere:
 python ~/.claude/guard/claude-guard.py --test
 ```
 
-You should see a fixture of commands and their scores. Then **open a new Claude Code session** (existing sessions don't reload `settings.json`). The next Bash / Edit / Write / MCP tool call routes through the hook. Watch decisions land in real time:
+You should see the threshold values printed, then the fixture commands listed with their decisions (ALLOW / ASK / DENY), scores, and signal breakdowns. If the header contains `!! rules.py error: ...`, fix the broken rules file before continuing — the hook will fall back to forcing every command into the "ask" prompt until you do. Then **open a new Claude Code session** (existing sessions don't reload `settings.json`). The next Bash / Edit / Write / MCP tool call routes through the hook. Watch decisions land in real time:
 
 - **Live dashboard:** http://127.0.0.1:7475 (auto-launches on every session via the `SessionStart` hook)
 - **Raw log:** `~/.claude/guard/audit.jsonl`
@@ -78,22 +78,46 @@ There's no daemon to start. The hook is invoked by Claude Code itself:
 - `SessionStart` launches the dashboard once per session (idempotent — won't double-start if already running).
 - Both are merged into `~/.claude/settings.json` by `install.py`.
 
+The exact `python` interpreter used to run `install.py` is baked into the hook command — so the hook doesn't depend on `python` being on `PATH` at runtime (the #1 reason it used to silently fail on Windows). If you later switch interpreters, re-run the installer with the new one.
+
 ## Updating
 
-Source-code changes don't reach the live hook until you re-run the installer (the install dir is a separate copy of the files). The flow:
+Source-code changes don't reach the live hook until you re-run the installer (the install dir is a separate copy of the files). For the default one-liner install (clone is the install dir):
 
 ```bash
-# 1. Stop the dashboard so it isn't holding files open
-python ~/.claude/guard/dashboard.py --stop
+python ~/.claude/guard/install.py --update
+```
 
-# 2a. If your install dir is itself a git clone (the default):
-git -C ~/.claude/guard pull && python ~/.claude/guard/install.py --global --yes
+That stops the dashboard, runs `git -C ~/.claude/guard pull --ff-only`, re-copies files, re-verifies `rules.py`, and re-merges `settings.json`. Open a new Claude Code session; the dashboard relaunches automatically.
 
-# 2b. Or if you keep a separate source clone:
+If you keep a separate source clone (you cloned somewhere else and installed from there), update by hand:
+
+```bash
 git -C /path/to/your/claude-guard pull && python /path/to/your/claude-guard/install.py --global --yes
 ```
 
-Open a new Claude Code session. The dashboard relaunches automatically.
+**Heads-up:** re-running `install.py` overwrites `rules.py` from the source. If you've tuned thresholds or added local pattern rules, keep them in `rules_user.py` (see [Tuning](#tuning-to-your-workflow)) so updates don't clobber them.
+
+## Uninstall
+
+**macOS / Linux**
+```bash
+rm -rf ~/.claude/guard
+```
+
+**Windows (PowerShell)**
+```powershell
+Remove-Item -Recurse -Force "$env:USERPROFILE\.claude\guard"
+```
+
+**Windows (cmd.exe)**
+```
+rmdir /s /q "%USERPROFILE%\.claude\guard"
+```
+
+Then open `~/.claude/settings.json` (`%USERPROFILE%\.claude\settings.json` on Windows) and delete the two blocks that reference `claude-guard.py` and `dashboard.py` — the `PreToolUse` entry and the `SessionStart` entry. Leave any other hooks in place.
+
+For a per-project install, swap `~/.claude/guard` for `<project>/.claude/guard` and edit `<project>/.claude/settings.json` instead.
 
 ## Troubleshooting
 
@@ -311,8 +335,8 @@ A future improvement is a sidecar script that pulls these weekly and merges them
 
 In rough priority order:
 
-1. **Sidecar updater** that fetches the GHSA + OSV feeds and writes a fresh `COMPROMISED_PACKAGES` block, run on a schedule.
-2. **LLM-fallback rule** using Claude Code's `type: "prompt"` hooks for the ambiguous ask-band cases. The Haiku-classified decision gets a small point adjustment so the human prompt becomes "we think this is fine because X" rather than "here's a raw breakdown."
+1. **Sidecar updater** — done. `update_threat_feed.py` pulls OSV's npm + PyPI feeds and writes `compromised_packages_auto.py` next to `rules.py`. Wire it into cron / Task Scheduler for nightly refresh.
+2. **LLM-fallback rule** — done. `llm_fallback.py` calls Claude Haiku on the ambiguous ask-band cases and lets a high-confidence verdict tip the decision. Requires `ANTHROPIC_API_KEY`; if unset, deterministic scoring is used and the fallback is silently skipped — the engine still works fully.
 3. **Project-aware allow rules.** Rather than one global rules.py, support a `.claude/guard/project.py` that adds project-specific allowlist patterns (e.g., per-client conventions) without forking the base rules.
 4. **VS Code extension** as originally discussed: sidebar showing recent decisions from `audit.jsonl`, one-click "add to allowlist" buttons, a "tighten thresholds" toggle. This is polish on top of the engine, not a replacement.
 5. **Decision feedback loop.** Track which "ask" prompts the human approved versus rejected; surface rules whose ask-approval rate is >95% as candidates for moving into the allow band.
