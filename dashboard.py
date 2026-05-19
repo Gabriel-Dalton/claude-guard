@@ -534,14 +534,28 @@ button:focus-visible, input:focus-visible, [tabindex]:focus-visible {
 /* ─── layout ───────────────────────────────────────────────── */
 .app {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 340px;
-  gap: 1.25rem;
-  padding: 1.25rem;
-  max-width: 1500px;
+  grid-template-columns: minmax(0, 1fr) 320px;
+  gap: 1rem;
+  padding: 0.9rem 1.1rem 1rem;
   margin: 0 auto;
+}
+@media (min-width: 1700px) {
+  .app { grid-template-columns: minmax(0, 1fr) 360px; }
 }
 @media (max-width: 960px) {
   .app { grid-template-columns: 1fr; }
+}
+
+/* charts that should sit side-by-side on wide screens */
+.chart-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 1rem;
+  margin-bottom: 1rem;
+}
+.chart-row > .card { margin-bottom: 0; }
+@media (max-width: 1100px) {
+  .chart-row { grid-template-columns: 1fr; }
 }
 
 h1 {
@@ -649,9 +663,9 @@ h1 {
 .histogram {
   display: grid;
   grid-template-columns: repeat(10, 1fr);
-  gap: 0.35rem;
+  gap: 0.3rem;
   align-items: end;
-  height: 95px;
+  height: 70px;
   padding: 0 0.2rem;
 }
 .bar {
@@ -684,23 +698,35 @@ h1 {
   color: var(--fg-faint);
   letter-spacing: 0.04em;
 }
-.histogram-wrap { padding: 0 0 1.7rem; }
+.histogram-wrap { padding: 0.5rem 0.9rem 1.5rem; }
 
 /* ─── timeseries sparkline (svg) ──────────────────────────── */
+.spark-wrap {
+  position: relative;
+  height: 95px;
+}
 .spark {
   width: 100%;
-  height: 64px;
+  height: 100%;
   display: block;
 }
 .spark-grid { stroke: var(--border-soft); stroke-width: 1; }
 .spark-stack-allow { fill: var(--good); opacity: 0.5; }
 .spark-stack-ask   { fill: var(--warn); opacity: 0.65; }
 .spark-stack-deny  { fill: var(--bad);  opacity: 0.85; }
-.spark-label {
+.spark-overlay {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
   font-family: var(--font-mono);
   font-size: 0.62rem;
-  fill: var(--fg-soft);
+  color: var(--fg-soft);
+  letter-spacing: 0.02em;
 }
+.spark-overlay > span { position: absolute; line-height: 1; }
+.spark-overlay .top-left     { top: 4px;    left: 8px; }
+.spark-overlay .bottom-left  { bottom: 4px; left: 8px; }
+.spark-overlay .bottom-right { bottom: 4px; right: 8px; }
 
 /* ─── filter row ──────────────────────────────────────────── */
 .filters {
@@ -743,7 +769,7 @@ h1 {
 .search::placeholder { color: var(--fg-faint); }
 
 /* ─── decision feed ───────────────────────────────────────── */
-.feed { max-height: 60vh; overflow-y: auto; }
+.feed { max-height: calc(100vh - 460px); min-height: 220px; overflow-y: auto; }
 .feed::-webkit-scrollbar { width: 8px; }
 .feed::-webkit-scrollbar-thumb { background: var(--bg-elev-3); border-radius: 4px; }
 .feed::-webkit-scrollbar-track { background: transparent; }
@@ -975,26 +1001,35 @@ h1 {
       </div>
     </div>
 
-    <div class="card">
-      <div class="card-head">
-        <span>score distribution</span>
-        <span class="spacer"></span>
-        <span class="muted" id="hist-summary"></span>
+    <div class="chart-row">
+      <div class="card">
+        <div class="card-head">
+          <span>score distribution</span>
+          <span class="spacer"></span>
+          <span class="muted" id="hist-summary"></span>
+        </div>
+        <div class="card-body histogram-wrap">
+          <div class="histogram" id="hist" role="img" aria-label="Score distribution histogram"></div>
+        </div>
       </div>
-      <div class="card-body histogram-wrap">
-        <div class="histogram" id="hist" role="img" aria-label="Score distribution histogram"></div>
-      </div>
-    </div>
 
-    <div class="card">
-      <div class="card-head">
-        <span>decisions over window</span>
-        <span class="spacer"></span>
-        <span class="muted" id="ts-summary"></span>
-      </div>
-      <div class="card-body">
-        <svg class="spark" id="spark" viewBox="0 0 600 64" preserveAspectRatio="none"
-             role="img" aria-label="Decisions per time bucket"></svg>
+      <div class="card">
+        <div class="card-head">
+          <span>decisions over window</span>
+          <span class="spacer"></span>
+          <span class="muted" id="ts-summary"></span>
+        </div>
+        <div class="card-body">
+          <div class="spark-wrap">
+            <svg class="spark" id="spark" viewBox="0 0 600 64" preserveAspectRatio="none"
+                 role="img" aria-label="Decisions per time bucket"></svg>
+            <div class="spark-overlay" aria-hidden="true">
+              <span class="top-left"     id="spark-peak"></span>
+              <span class="bottom-left"  id="spark-start"></span>
+              <span class="bottom-right" id="spark-end">now</span>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -1113,7 +1148,7 @@ function renderHistogram() {
   const labels = ["0–9","10–19","20–29","30–39","40–49","50–59","60–69","70–79","80–89","90–100"];
   let html = "";
   for (let i = 0; i < 10; i++) {
-    const h = Math.round((hist[i] / max) * 88);   // 88px of headroom in the 95px row
+    const h = Math.round((hist[i] / max) * 62);   // 62px of headroom in the 70px row
     const cls = i < 3 ? "lo" : (i < 6 ? "mid" : "hi");
     html += `
       <div class="bar ${cls}" style="height:${Math.max(2, h)}px"
@@ -1132,8 +1167,11 @@ function renderSparkline() {
   const ts = (state.stats && state.stats.timeseries) || null;
   const W = 600, H = 64, padX = 6, padY = 6;
   if (!ts || !ts.buckets) {
-    $("spark").innerHTML = `<text class="spark-label" x="${padX}" y="${H/2}">no data in window</text>`;
-    $("ts-summary").textContent = "";
+    $("spark").innerHTML = "";
+    $("spark-peak").textContent  = "no data in window";
+    $("spark-start").textContent = "";
+    $("spark-end").textContent   = "";
+    $("ts-summary").textContent  = "";
     return;
   }
   const n = ts.buckets;
@@ -1160,18 +1198,15 @@ function renderSparkline() {
   const baseDeny  = allow.map((a, i) => a + ask[i]);
   const denyPath  = areaPath(deny, baseDeny);
 
-  const startLabel = bucketLabel(ts.start);
-  const endLabel = "now";
-  const peakLabel = `peak ${max}`;
   $("spark").innerHTML = `
     <line class="spark-grid" x1="${padX}" y1="${H-padY}" x2="${W-padX}" y2="${H-padY}"/>
     <path class="spark-stack-allow" d="${allowPath}"></path>
     <path class="spark-stack-ask"   d="${askPath}"></path>
     <path class="spark-stack-deny"  d="${denyPath}"></path>
-    <text class="spark-label" x="${padX}" y="${H-1}" text-anchor="start">${fmt.esc(startLabel)}</text>
-    <text class="spark-label" x="${W-padX}" y="${H-1}" text-anchor="end">${endLabel}</text>
-    <text class="spark-label" x="${padX}" y="10">${peakLabel}/bucket</text>
   `;
+  $("spark-peak").textContent  = `peak ${max}/bucket`;
+  $("spark-start").textContent = bucketLabel(ts.start);
+  $("spark-end").textContent   = "now";
   const bucketMinutes = Math.round((ts.bucket_seconds || 0) / 60);
   $("ts-summary").textContent = `${n} buckets · ~${bucketMinutes}m each`;
 }

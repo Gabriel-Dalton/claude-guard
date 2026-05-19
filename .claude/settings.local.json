@@ -35,7 +35,8 @@
       "Bash(curl -s \"http://127.0.0.1:7475/api/stats?window=all\")",
       "Bash(curl -s \"http://127.0.0.1:7475/api/decisions?window=all&q=curl\")",
       "Bash(curl -s \"http://127.0.0.1:7475/api/decisions?window=all&filter=deny\")",
-      "Bash(curl -s http://127.0.0.1:7475/api/stats?window=__TRACKED_VAR__)"
+      "Bash(curl -s http://127.0.0.1:7475/api/stats?window=__TRACKED_VAR__)",
+      "PowerShell(Get-Process *)"
     ]
   }
 }

@@ -23,44 +23,142 @@ For every Bash tool call Claude makes, the hook does this:
 7. **Map score to decision.** Configurable thresholds (`allow_below`, `deny_at_or_above`) decide. Anything between thresholds falls through to Claude Code's normal prompt, but with the full signal breakdown attached so you can see exactly why it didn't auto-allow.
 8. **Log.** Every decision goes into `audit.jsonl` next to the script. Tail it during a working session to spot rules that are misfiring.
 
-## Quick start
+## Install
 
-Drop the contents of this folder into `.claude/guard/` at the root of any project where you run Claude Code:
+One global install protects every Claude Code project on this machine. Pick the line for your OS, paste it into a terminal, done.
 
-```
-your-project/
-├── .claude/
-│   ├── settings.json
-│   └── guard/
-│       ├── claude-guard.py
-│       ├── rules.py
-│       └── audit.jsonl   (created on first run)
+**macOS / Linux**
+```bash
+git clone https://github.com/Gabriel-Dalton/claude-guard ~/.claude/guard && python ~/.claude/guard/install.py --global --yes
 ```
 
-Then merge the `hooks` block from `settings.example.json` into your existing `.claude/settings.json`. The minimum needed is:
-
-```json
-{
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python \"$CLAUDE_PROJECT_DIR/.claude/guard/claude-guard.py\"",
-            "timeout": 5
-          }
-        ]
-      }
-    ]
-  }
-}
+**Windows (PowerShell)**
+```powershell
+git clone https://github.com/Gabriel-Dalton/claude-guard "$env:USERPROFILE\.claude\guard"; python "$env:USERPROFILE\.claude\guard\install.py" --global --yes
 ```
 
-That's it. The next time Claude Code wants to run a Bash command, the hook fires, the engine scores it, and the decision goes back to Claude Code via stdout JSON.
+**Windows (cmd.exe)**
+```
+git clone https://github.com/Gabriel-Dalton/claude-guard "%USERPROFILE%\.claude\guard" && python "%USERPROFILE%\.claude\guard\install.py" --global --yes
+```
 
-Run `python claude-guard.py --test` from the guard folder to see how a fixture of common commands scores under the current rules. Use this when tuning.
+That clones the repo into `~/.claude/guard/`, copies the hook files into place, merges the `PreToolUse` + `SessionStart` hooks into `~/.claude/settings.json`, and (optionally) downloads the malicious-package threat feed. Re-running it is idempotent — safe to repeat after every `git pull`.
+
+<details>
+<summary><strong>Other ways to install</strong></summary>
+
+- **Interactive (you get asked each step):** drop `--yes`. The installer prompts for global vs per-project, overwriting existing files, and fetching the threat feed.
+- **Per-project only (fires for one project, not the whole machine):**
+  ```
+  python install.py --project /path/to/project --yes
+  ```
+  Files land in `<project>/.claude/guard/`, the hook is merged into `<project>/.claude/settings.json`.
+- **Skip the threat feed download:** add `--skip-feed`. You can fetch it later with `python ~/.claude/guard/update_threat_feed.py`.
+
+</details>
+
+## Verify
+
+Run the self-test from anywhere:
+
+```bash
+python ~/.claude/guard/claude-guard.py --test
+```
+
+You should see a fixture of commands and their scores. Then **open a new Claude Code session** (existing sessions don't reload `settings.json`). The next Bash / Edit / Write / MCP tool call routes through the hook. Watch decisions land in real time:
+
+- **Live dashboard:** http://127.0.0.1:7475 (auto-launches on every session via the `SessionStart` hook)
+- **Raw log:** `~/.claude/guard/audit.jsonl`
+
+## How it runs after install
+
+There's no daemon to start. The hook is invoked by Claude Code itself:
+
+- `PreToolUse` fires on every `Bash`, `Edit`, `Write`, `MultiEdit`, `WebFetch`, `WebSearch`, and `mcp__*` call. The engine scores, decides `allow` / `ask` / `deny`, logs the result.
+- `SessionStart` launches the dashboard once per session (idempotent — won't double-start if already running).
+- Both are merged into `~/.claude/settings.json` by `install.py`.
+
+## Updating
+
+Source-code changes don't reach the live hook until you re-run the installer (the install dir is a separate copy of the files). The flow:
+
+```bash
+# 1. Stop the dashboard so it isn't holding files open
+python ~/.claude/guard/dashboard.py --stop
+
+# 2a. If your install dir is itself a git clone (the default):
+git -C ~/.claude/guard pull && python ~/.claude/guard/install.py --global --yes
+
+# 2b. Or if you keep a separate source clone:
+git -C /path/to/your/claude-guard pull && python /path/to/your/claude-guard/install.py --global --yes
+```
+
+Open a new Claude Code session. The dashboard relaunches automatically.
+
+## Troubleshooting
+
+<details>
+<summary><code>PermissionError: [WinError 32] The process cannot access the file because it is being used by another process</code> during install</summary>
+
+The dashboard process is holding files open in the install dir. Stop it, then re-run the installer:
+
+```powershell
+python "$env:USERPROFILE\.claude\guard\dashboard.py" --stop
+```
+
+It relaunches on the next Claude Code session.
+</details>
+
+<details>
+<summary><code>fatal: destination path '...\.claude\guard' already exists and is not an empty directory</code></summary>
+
+You already have claude-guard installed at that path. Skip the `git clone` step and run `install.py` directly (see [Updating](#updating)).
+</details>
+
+<details>
+<summary><code>python: can't open file 'claude-guard.py': No such file or directory</code></summary>
+
+You don't run `claude-guard.py` from inside your project — it's a hook that fires automatically. To test it, use the absolute path:
+
+```bash
+python ~/.claude/guard/claude-guard.py --test
+```
+</details>
+
+<details>
+<summary>The hook isn't firing on tool calls</summary>
+
+Existing Claude Code sessions don't reload `settings.json`. Close the session and start a fresh one. To confirm the hook is wired, check that `~/.claude/settings.json` contains a `PreToolUse` block with `claude-guard.py` in the command path.
+</details>
+
+<details>
+<summary>Dashboard isn't loading at 127.0.0.1:7475</summary>
+
+Check that it's running:
+
+```bash
+cat  ~/.claude/guard/dashboard.pid       # macOS / Linux
+type %USERPROFILE%\.claude\guard\dashboard.pid    # Windows (cmd)
+```
+
+If empty or the process is dead, start it manually:
+
+```bash
+python ~/.claude/guard/dashboard.py --ensure-running
+```
+</details>
+
+<details>
+<summary>Getting too many "ask" prompts</summary>
+
+After a week of real use, run `python ~/.claude/guard/tune.py review`. It clusters your noisy ask-band commands and offers to write allowlist patterns to `rules_user.py` (your base `rules.py` stays untouched, so future updates remain clean).
+</details>
+
+<details>
+<summary>Something I expected to be blocked got allowed</summary>
+
+Lower `THRESHOLDS["allow_below"]` in `rules.py`, or add a stricter pattern rule. Save — the next hook invocation picks it up. No restart, no rebuild.
+</details>
 
 ## The worked example
 

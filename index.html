@@ -1011,7 +1011,7 @@ footer .credit {
 <section class="install-detailed" aria-labelledby="install-h">
   <div class="wrap">
     <p class="eyebrow">install</p>
-    <h2 id="install-h">Three steps. Or really, one.</h2>
+    <h2 id="install-h">Paste one line. Open Claude. Done.</h2>
 
     <div class="steps">
 
@@ -1019,20 +1019,24 @@ footer .credit {
         <span class="step__num" aria-hidden="true">01</span>
         <div class="step__body">
           <h3>Run the one line</h3>
-          <p>The installer asks if you want global (every Claude Code project on this machine, recommended for daily use) or per-project (just one folder). It copies the files, merges the hook into the right <code>settings.json</code>, and optionally fetches the malicious-package feed. Re-running it is idempotent.</p>
+          <p>This is the recommended path: global install with no prompts. Clones the repo into <code>~/.claude/guard/</code>, copies the hook files, merges the <code>PreToolUse</code> + <code>SessionStart</code> hooks into <code>~/.claude/settings.json</code>, and fetches the malicious-package threat feed. Re-runnable.</p>
 
           <h4>macOS / Linux</h4>
           <pre class="code-block"><span class="p">$</span> git clone https://github.com/Gabriel-Dalton/claude-guard ~/.claude/guard <span class="c">\</span>
-    &amp;&amp; python ~/.claude/guard/install.py</pre>
+    &amp;&amp; python ~/.claude/guard/install.py --global --yes</pre>
 
           <h4 style="margin-top:1.5rem">Windows (PowerShell)</h4>
-          <pre class="code-block"><span class="p">&gt;</span> git clone https://github.com/Gabriel-Dalton/claude-guard `
+          <pre class="code-block"><span class="p">&gt;</span> git clone https://github.com/Gabriel-Dalton/claude-guard <span class="c">`</span>
     "<span class="c">$env:USERPROFILE</span>\.claude\guard"; <span class="c">`</span>
-  python "<span class="c">$env:USERPROFILE</span>\.claude\guard\install.py"</pre>
+  python "<span class="c">$env:USERPROFILE</span>\.claude\guard\install.py" --global --yes</pre>
 
           <h4 style="margin-top:1.5rem">Windows (cmd.exe)</h4>
           <pre class="code-block"><span class="p">&gt;</span> git clone https://github.com/Gabriel-Dalton/claude-guard "<span class="c">%USERPROFILE%</span>\.claude\guard" ^
-    &amp;&amp; python "<span class="c">%USERPROFILE%</span>\.claude\guard\install.py"</pre>
+    &amp;&amp; python "<span class="c">%USERPROFILE%</span>\.claude\guard\install.py" --global --yes</pre>
+
+          <p style="margin-top:1.25rem; color: var(--fg-soft); font-size: 0.95em">
+            Want something different? Drop <code>--yes</code> to be prompted at each step. Use <code>--project /path/to/project</code> instead of <code>--global</code> to install for one folder only. Add <code>--skip-feed</code> to skip the ~30 sec threat-feed download.
+          </p>
         </div>
       </div>
 
@@ -1052,8 +1056,20 @@ footer .credit {
       <div class="step">
         <span class="step__num" aria-hidden="true">03</span>
         <div class="step__body">
-          <h3>Open a Claude Code session</h3>
-          <p>That's it. The hook fires on every Bash command Claude tries to run. The boring stuff goes through silently. Ambiguous stuff still asks. Dangerous stuff gets blocked. After a week, run <code>tune.py review</code> to cut down the asks even further.</p>
+          <h3>Open a new Claude Code session</h3>
+          <p>That's it. There's no daemon to start. The <code>PreToolUse</code> hook fires on every Bash, Edit, Write, and MCP tool call. Boring stuff goes through silently. Ambiguous stuff still asks. Dangerous stuff gets blocked. Existing sessions won't pick up the hook until you restart them.</p>
+        </div>
+      </div>
+
+      <div class="step">
+        <span class="step__num" aria-hidden="true">04</span>
+        <div class="step__body">
+          <h3>Verify it's running</h3>
+          <p>Run the self-test from anywhere — it scores a fixture of common commands and prints the breakdown:</p>
+          <pre class="code-block"><span class="p">$</span> python ~/.claude/guard/claude-guard.py --test</pre>
+          <p style="margin-top:1rem">Then watch live decisions roll in. The <code>SessionStart</code> hook auto-launches a local dashboard at:</p>
+          <pre class="code-block"><span class="c">http://127.0.0.1:7475</span></pre>
+          <p style="margin-top:1rem">Raw decision log is at <code>~/.claude/guard/audit.jsonl</code>. After a week of real use, run <code>python ~/.claude/guard/tune.py review</code> to cluster noisy ask-band commands into clean allowlist entries.</p>
         </div>
       </div>
 
@@ -1116,6 +1132,92 @@ footer .credit {
           <p>Yes. Designed and tested on Windows 11 with PowerShell as a first-class shell. Path normalisation treats <code>\</code> and <code>/</code> as equivalent. PowerShell-style commands get their own detection layer. The installer's settings.json merge handles both POSIX and Windows-style hook command paths.</p>
         </div>
       </details>
+    </div>
+  </div>
+</section>
+
+<!-- ─── TROUBLESHOOTING ─────────────────────────────────────────────────── -->
+<section class="faq" aria-labelledby="trouble-h">
+  <div class="wrap">
+    <p class="eyebrow">if something's wrong</p>
+    <h2 id="trouble-h">Troubleshooting.</h2>
+
+    <div class="faq__list">
+
+      <details>
+        <summary>Install fails with <code>PermissionError: [WinError 32]</code></summary>
+        <div class="faq__answer">
+          <p>The live dashboard is holding files open in the install directory. Stop it, then re-run the installer. It relaunches automatically on the next Claude Code session.</p>
+          <pre class="code-block"><span class="p">&gt;</span> python "<span class="c">$env:USERPROFILE</span>\.claude\guard\dashboard.py" --stop</pre>
+        </div>
+      </details>
+
+      <details>
+        <summary><code>fatal: destination path '...\.claude\guard' already exists</code></summary>
+        <div class="faq__answer">
+          <p>You already have claude-guard installed at that path. Skip the <code>git clone</code> and run <code>install.py</code> directly — it's idempotent and will update settings.json without re-cloning.</p>
+          <pre class="code-block"><span class="p">$</span> python ~/.claude/guard/install.py --global --yes</pre>
+        </div>
+      </details>
+
+      <details>
+        <summary><code>python: can't open file 'claude-guard.py'</code></summary>
+        <div class="faq__answer">
+          <p>You don't run <code>claude-guard.py</code> from inside your project — it's a hook script Claude Code invokes automatically. To run the self-test, use the absolute path:</p>
+          <pre class="code-block"><span class="p">$</span> python ~/.claude/guard/claude-guard.py --test</pre>
+        </div>
+      </details>
+
+      <details>
+        <summary>The hook isn't firing on tool calls</summary>
+        <div class="faq__answer">
+          <p>Existing Claude Code sessions don't reload <code>settings.json</code>. Close the session and start a new one. To confirm the hook is wired, look for a <code>PreToolUse</code> entry referencing <code>claude-guard.py</code> in <code>~/.claude/settings.json</code>.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>Dashboard isn't loading at 127.0.0.1:7475</summary>
+        <div class="faq__answer">
+          <p>Check that it's running:</p>
+          <pre class="code-block"><span class="c"># macOS / Linux</span>
+<span class="p">$</span> cat ~/.claude/guard/dashboard.pid
+
+<span class="c"># Windows</span>
+<span class="p">&gt;</span> type <span class="c">%USERPROFILE%</span>\.claude\guard\dashboard.pid</pre>
+          <p>If empty or the process is gone, start it manually. It'll pick the port from <code>--port</code> or default to 7475.</p>
+          <pre class="code-block"><span class="p">$</span> python ~/.claude/guard/dashboard.py --ensure-running</pre>
+        </div>
+      </details>
+
+      <details>
+        <summary>How do I update to the latest version?</summary>
+        <div class="faq__answer">
+          <p>The install directory holds its own copy of the files. Pulling the source repo doesn't change the live hook until you re-run the installer.</p>
+          <pre class="code-block"><span class="c"># Stop the dashboard so it isn't holding files open</span>
+<span class="p">$</span> python ~/.claude/guard/dashboard.py --stop
+
+<span class="c"># Pull + reinstall</span>
+<span class="p">$</span> git -C ~/.claude/guard pull <span class="c">\</span>
+    &amp;&amp; python ~/.claude/guard/install.py --global --yes</pre>
+          <p>Open a new Claude Code session and the dashboard relaunches.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>Too many "ask" prompts for commands I trust</summary>
+        <div class="faq__answer">
+          <p>After a week of real use, run the tuner. It clusters your repeated ask-band commands and offers to write tight allowlist patterns into <code>rules_user.py</code> (your base <code>rules.py</code> stays clean for future updates).</p>
+          <pre class="code-block"><span class="p">$</span> python ~/.claude/guard/tune.py review</pre>
+        </div>
+      </details>
+
+      <details>
+        <summary>Something I expected to be blocked got allowed</summary>
+        <div class="faq__answer">
+          <p>Edit <code>rules.py</code>. Lower <code>THRESHOLDS["allow_below"]</code> to make the engine more cautious, or add a stricter pattern rule. Save the file — the next hook invocation picks it up. No restart, no rebuild.</p>
+        </div>
+      </details>
+
     </div>
   </div>
 </section>

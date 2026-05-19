@@ -34,6 +34,7 @@ FILES = [
     "anomaly.py",
     "tune.py",
     "update_threat_feed.py",
+    "dashboard.py",
     "settings.example.json",
     "README.md",
 ]
@@ -50,6 +51,12 @@ HOOK_COMMAND_TEMPLATE_GLOBAL = (
 )
 HOOK_COMMAND_TEMPLATE_PROJECT = (
     'python "$CLAUDE_PROJECT_DIR/.claude/guard/claude-guard.py"'
+)
+DASHBOARD_COMMAND_TEMPLATE_GLOBAL = (
+    'python "{install_dir}/dashboard.py" --ensure-running'
+)
+DASHBOARD_COMMAND_TEMPLATE_PROJECT = (
+    'python "$CLAUDE_PROJECT_DIR/.claude/guard/dashboard.py" --ensure-running'
 )
 
 
@@ -254,6 +261,62 @@ def merge_hook(settings: dict, hook_command: str) -> bool:
     return True
 
 
+def merge_session_hook(settings: dict, hook_command: str) -> bool:
+    """Wire the dashboard launcher into SessionStart. Mirrors merge_hook but
+    matches by "dashboard.py" in the command path."""
+    settings.setdefault("hooks", {})
+    if not isinstance(settings["hooks"], dict):
+        settings["hooks"] = {}
+    sess = settings["hooks"].setdefault("SessionStart", [])
+    if not isinstance(sess, list):
+        sess = []
+        settings["hooks"]["SessionStart"] = sess
+
+    new_hook = {
+        "type": "command",
+        "command": hook_command,
+        "timeout": GUARD_TIMEOUT,
+    }
+
+    guard_entry = None
+    for entry in sess:
+        if (
+            isinstance(entry, dict)
+            and isinstance(entry.get("hooks"), list)
+            and any(
+                isinstance(h, dict)
+                and isinstance(h.get("command"), str)
+                and "dashboard.py" in h["command"]
+                for h in entry["hooks"]
+            )
+        ):
+            guard_entry = entry
+            break
+
+    if guard_entry is None:
+        sess.append({"matcher": "*", "hooks": [new_hook]})
+        return True
+
+    changed = False
+    if guard_entry.get("matcher") != "*":
+        guard_entry["matcher"] = "*"
+        changed = True
+
+    hooks_list = guard_entry["hooks"]
+    for i, h in enumerate(hooks_list):
+        if (
+            isinstance(h, dict)
+            and isinstance(h.get("command"), str)
+            and "dashboard.py" in h["command"]
+        ):
+            if h.get("command") != hook_command or h.get("timeout") != GUARD_TIMEOUT:
+                hooks_list[i] = new_hook
+                changed = True
+            return changed
+    hooks_list.append(new_hook)
+    return True
+
+
 def write_settings(path: Path, settings: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -396,15 +459,18 @@ def main() -> int:
 
     if mode == "global":
         settings_file = settings_path_for("global")
-        hook_cmd = HOOK_COMMAND_TEMPLATE_GLOBAL.format(
-            install_dir=str(install_dir).replace("\\", "/")
-        )
+        install_path_fwd = str(install_dir).replace("\\", "/")
+        hook_cmd = HOOK_COMMAND_TEMPLATE_GLOBAL.format(install_dir=install_path_fwd)
+        dash_cmd = DASHBOARD_COMMAND_TEMPLATE_GLOBAL.format(install_dir=install_path_fwd)
     else:
         settings_file = settings_path_for("project", install_dir)
         hook_cmd = HOOK_COMMAND_TEMPLATE_PROJECT
+        dash_cmd = DASHBOARD_COMMAND_TEMPLATE_PROJECT
 
     settings, existed = load_settings(settings_file)
-    changed = merge_hook(settings, hook_cmd)
+    pre_changed = merge_hook(settings, hook_cmd)
+    sess_changed = merge_session_hook(settings, dash_cmd)
+    changed = pre_changed or sess_changed
     if changed:
         write_settings(settings_file, settings)
         ok(f"{'updated' if existed else 'created'} {settings_file}")
