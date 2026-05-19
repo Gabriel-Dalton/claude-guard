@@ -21,7 +21,14 @@
       "Bash($PY *)",
       "Bash(/c/Users/Gabriel-Dalton/AppData/Local/Programs/Python/Python312/python.exe C:/Users/Gabriel-Dalton/Documents/GitHub/claude-guard/claude-guard.py --test)",
       "Bash(cp C:/Users/Gabriel-Dalton/Documents/GitHub/claude-guard/claude-guard.py C:/Users/Gabriel-Dalton/.claude/guard/claude-guard.py)",
-      "Bash(cp C:/Users/Gabriel-Dalton/Documents/GitHub/claude-guard/rules.py C:/Users/Gabriel-Dalton/.claude/guard/rules.py)"
+      "Bash(cp C:/Users/Gabriel-Dalton/Documents/GitHub/claude-guard/rules.py C:/Users/Gabriel-Dalton/.claude/guard/rules.py)",
+      "Bash(curl -s -o /dev/null -w \"HTTP %{http_code}, %{size_download} bytes, %{content_type}\\\\n\" http://127.0.0.1:8788/)",
+      "Bash(curl -s http://127.0.0.1:8788/history)",
+      "Bash(timeout 3 curl -s -N http://127.0.0.1:8788/events)",
+      "Bash(taskkill //F //IM python.exe //FI \"WINDOWTITLE eq dashboard*\")",
+      "Bash(netstat -ano)",
+      "Bash(findstr :8788)",
+      "Bash(taskkill //F //PID 14032)"
     ]
   }
 }
