@@ -1,0 +1,12 @@
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local runtime state written by the dashboard launcher
+dashboard.pid
+dashboard.port
+
+# Editor / OS junk
+.DS_Store
+*.swp
