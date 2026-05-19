@@ -1,140 +1,325 @@
 #!/usr/bin/env python3
 """
-claude-guard dashboard.
-
-A single-file local web dashboard for the audit log. Streams new decisions
-live via Server-Sent Events. Zero external dependencies (stdlib only).
+claude-guard dashboard — a single-file local operations console for the
+PreToolUse hook's decision log.
 
 Usage:
     python dashboard.py
     python dashboard.py --port 9000
     python dashboard.py --log /path/to/audit.jsonl
-    python dashboard.py --no-open      # do not auto-open the browser
+    python dashboard.py --no-browser
 
-The default log path is the audit.jsonl next to this file.
+The dashboard binds to 127.0.0.1, reads audit.jsonl fresh on every API
+request (no caching beyond the OS file cache), and the browser polls every
+two seconds. Python 3.9+ standard library only. No frameworks, no chart
+libraries, no build step. See DASHBOARD.md for the design brief.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
-import queue
+import re
 import sys
 import threading
 import time
 import webbrowser
+from collections import Counter
+from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
-DEFAULT_PORT = 8787
-HISTORY_LIMIT = 200
-TAIL_POLL_SECS = 0.25
+DEFAULT_PORT = 7475
+HISTOGRAM_BUCKETS = 10
+TOP_N = 10
+DECISION_LIMIT = 200
+
+# Window selector values map to a duration in seconds. "all" means no cutoff.
+WINDOWS = {
+    "1h":  3600,
+    "24h": 86400,
+    "7d":  604800,
+    "all": None,
+}
 
 
 # ============================================================================
-# State shared between the tailer thread and HTTP handlers
+# Data layer — reads audit.jsonl on every call
 # ============================================================================
 
-class Hub:
-    def __init__(self, log_path: Path):
-        self.log_path = log_path
-        self.subscribers: list[queue.Queue] = []
-        self.subscribers_lock = threading.Lock()
-        self.shutdown_event = threading.Event()
+def read_audit_log(path: Path) -> list[dict]:
+    """Return all decisions from the log, oldest-first.
 
-    def subscribe(self) -> queue.Queue:
-        q: queue.Queue = queue.Queue(maxsize=1000)
-        with self.subscribers_lock:
-            self.subscribers.append(q)
-        return q
-
-    def unsubscribe(self, q: queue.Queue) -> None:
-        with self.subscribers_lock:
-            try:
-                self.subscribers.remove(q)
-            except ValueError:
-                pass
-
-    def broadcast(self, entry: dict) -> None:
-        with self.subscribers_lock:
-            dead = []
-            for q in self.subscribers:
-                try:
-                    q.put_nowait(entry)
-                except queue.Full:
-                    dead.append(q)
-            for q in dead:
-                try:
-                    self.subscribers.remove(q)
-                except ValueError:
-                    pass
-
-    def read_history(self, n: int) -> list[dict]:
-        if not self.log_path.exists():
-            return []
-        # Reading the whole file is fine for a local dashboard — audit.jsonl
-        # is short-lived data and typically a few MB at most.
-        out: list[dict] = []
-        try:
-            with self.log_path.open("r", encoding="utf-8") as f:
-                lines = f.readlines()
-        except OSError:
-            return []
-        for line in lines[-n:]:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                out.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
-        return out
-
-
-def tail_thread(hub: Hub) -> None:
-    """Watch the log file and broadcast new entries to subscribers.
-
-    Handles: file not yet existing, file rotation (size shrinks), partial
-    lines mid-write. Plain polling — no inotify dependency.
+    Returns an empty list when the file is missing or unreadable. Malformed
+    lines are silently skipped — the log is append-only and may contain a
+    partial trailing line at any moment.
     """
-    last_pos = 0
-    if hub.log_path.exists():
+    if not path.exists():
+        return []
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+    except OSError:
+        return []
+    out = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
         try:
-            last_pos = hub.log_path.stat().st_size
-        except OSError:
-            last_pos = 0
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return out
 
-    buffer = ""
-    while not hub.shutdown_event.is_set():
-        try:
-            if not hub.log_path.exists():
-                time.sleep(TAIL_POLL_SECS)
-                continue
-            size = hub.log_path.stat().st_size
-            if size < last_pos:
-                # Rotated or truncated.
-                last_pos = 0
-                buffer = ""
-            if size > last_pos:
-                with hub.log_path.open("r", encoding="utf-8", errors="replace") as f:
-                    f.seek(last_pos)
-                    chunk = f.read(size - last_pos)
-                    last_pos = f.tell()
-                buffer += chunk
-                while "\n" in buffer:
-                    line, buffer = buffer.split("\n", 1)
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        hub.broadcast(json.loads(line))
-                    except json.JSONDecodeError:
-                        continue
-        except OSError:
-            pass
-        time.sleep(TAIL_POLL_SECS)
+
+def _parse_ts(ts: object) -> float | None:
+    """Parse an ISO-8601 timestamp to a POSIX float. None on failure."""
+    if not isinstance(ts, str):
+        return None
+    s = ts
+    # datetime.fromisoformat accepts "+00:00" but not the bare "Z" suffix
+    # before Python 3.11. Normalize.
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(s).timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
+def filter_by_window(entries: list[dict], window: str) -> list[dict]:
+    seconds = WINDOWS.get(window)
+    if seconds is None:
+        return entries
+    cutoff = time.time() - seconds
+    out = []
+    for e in entries:
+        t = _parse_ts(e.get("ts"))
+        if t is None or t >= cutoff:
+            # Keep entries with unparseable timestamps too — better to over-
+            # show than to silently drop them.
+            out.append(e)
+    return out
+
+
+def filter_decisions(
+    entries: list[dict],
+    decision_filter: str,
+    query: str,
+) -> list[dict]:
+    """Apply the decision-type chip and free-text search filters."""
+    out = entries
+    if decision_filter and decision_filter != "all":
+        out = [e for e in out if (e.get("decision") or "").lower() == decision_filter]
+    q = (query or "").strip().lower()
+    if q:
+        def hay(e):
+            sigs = " ".join((s.get("name") or "") for s in (e.get("signals") or []))
+            return (
+                f"{e.get('command','')} {e.get('tool','')} "
+                f"{e.get('project_dir','')} {sigs}"
+            ).lower()
+        out = [e for e in out if q in hay(e)]
+    return out
+
+
+# ----------------------------------------------------------------------------
+# Aggregations
+# ----------------------------------------------------------------------------
+
+_URL_DOMAIN_RE = re.compile(r"https?://([^/\s)]+)", re.I)
+_SYNTHETIC_PREFIXES = (
+    "Edit:", "Write:", "MultiEdit:", "WebFetch:", "WebSearch:",
+)
+
+
+def cluster_key(command: str) -> str:
+    """Reduce a command to a short cluster key for grouping ask-band entries.
+
+    Rules:
+      - Bash: first two whitespace-separated tokens (e.g. ``"npm install"``).
+      - Synthetic non-Bash commands written by the V3 dispatcher look like
+        ``"Tool:payload"``. Key by tool plus either the URL host or the
+        parent directory of the path.
+      - MCP synthetic strings start with ``"mcp__server__action"`` — key by
+        that prefix (drop the JSON args).
+    """
+    cmd = (command or "").strip()
+    if not cmd:
+        return ""
+
+    # MCP synthetic commands
+    if cmd.startswith("mcp__"):
+        head = cmd.split(":", 1)[0]
+        return head
+
+    # Edit/Write/Web synthetic commands
+    for prefix in _SYNTHETIC_PREFIXES:
+        if cmd.startswith(prefix):
+            rest = cmd[len(prefix):].strip()
+            label = prefix[:-1]  # drop trailing ':'
+            m = _URL_DOMAIN_RE.match(rest)
+            if m:
+                return f"{label}: {m.group(1).lower()}"
+            normalized = rest.replace("\\", "/")
+            if "/" in normalized:
+                parent = normalized.rsplit("/", 1)[0]
+                if len(parent) > 60:
+                    parent = "…" + parent[-58:]
+                return f"{label}: {parent}/"
+            return f"{label}: {rest[:50]}"
+
+    # Bash and everything else: first two tokens
+    tokens = cmd.split()
+    if not tokens:
+        return ""
+    if len(tokens) == 1:
+        return tokens[0][:40]
+    return f"{tokens[0]} {tokens[1]}"[:60]
+
+
+def _bucket_config(window: str, entries: list[dict]) -> tuple[int, float, float]:
+    """Decide (n_buckets, bucket_seconds, start_ts) for the time-series chart.
+
+    Aims for ~24-30 buckets across the chosen window so the sparkline has
+    visible resolution without aliasing.
+    """
+    now = time.time()
+    if window == "1h":
+        n, secs = 12, 300.0       # 12 buckets of 5 minutes
+        return n, secs, now - n * secs
+    if window == "24h":
+        n, secs = 24, 3600.0      # 24 hourly buckets
+        return n, secs, now - n * secs
+    if window == "7d":
+        n, secs = 28, 21600.0     # 28 buckets of 6 hours
+        return n, secs, now - n * secs
+
+    # "all" — span from the oldest entry to now, capped to 30 buckets
+    oldest = None
+    for e in entries:
+        t = _parse_ts(e.get("ts"))
+        if t is not None and (oldest is None or t < oldest):
+            oldest = t
+    if oldest is None or oldest >= now:
+        # No data or all in the future: show last hour by default
+        return 12, 300.0, now - 3600
+    span = max(now - oldest, 1.0)
+    n = 30
+    secs = span / n
+    return n, secs, oldest
+
+
+def compute_stats(all_entries: list[dict], window: str) -> dict:
+    """Compute every aggregate the frontend needs in one pass.
+
+    ``all_entries`` is the full log (oldest-first). We window inside this
+    function so the time-series can use either the windowed or full set
+    depending on the metric.
+    """
+    windowed = filter_by_window(all_entries, window)
+
+    total = len(windowed)
+    by_decision = Counter((e.get("decision") or "").lower() for e in windowed)
+    scores = [
+        e.get("score") for e in windowed
+        if isinstance(e.get("score"), (int, float))
+    ]
+    avg_score = round(sum(scores) / len(scores), 1) if scores else 0.0
+
+    # 10-bucket score histogram: [0-9], [10-19], ... [90-100].
+    histogram = [0] * HISTOGRAM_BUCKETS
+    for s in scores:
+        idx = int(s) // 10
+        if idx < 0:
+            idx = 0
+        elif idx >= HISTOGRAM_BUCKETS:
+            idx = HISTOGRAM_BUCKETS - 1
+        histogram[idx] += 1
+
+    # Top firing rules.
+    rule_counts: Counter[str] = Counter()
+    for e in windowed:
+        for sig in (e.get("signals") or []):
+            name = sig.get("name")
+            if name:
+                rule_counts[name] += 1
+    top_rules = [
+        {"name": n, "count": c} for n, c in rule_counts.most_common(TOP_N)
+    ]
+
+    # Tuning candidates: ask-band command clusters that repeat.
+    ask_clusters: Counter[str] = Counter()
+    ask_examples: dict[str, str] = {}
+    for e in windowed:
+        if (e.get("decision") or "").lower() != "ask":
+            continue
+        key = cluster_key(e.get("command", ""))
+        if not key:
+            continue
+        ask_clusters[key] += 1
+        if key not in ask_examples:
+            ask_examples[key] = e.get("command", "")
+    tuning_candidates = [
+        {"cluster": k, "count": c, "example": ask_examples.get(k, "")}
+        for k, c in ask_clusters.most_common(TOP_N)
+        if c >= 2
+    ]
+
+    # Project breakdown.
+    project_counts: Counter[str] = Counter(
+        e.get("project_dir") for e in windowed if e.get("project_dir")
+    )
+    projects = [
+        {"path": p, "count": c} for p, c in project_counts.most_common(TOP_N)
+    ]
+
+    # Time-series (decisions per bucket) over the chosen window.
+    n_buckets, bucket_secs, start_ts = _bucket_config(window, all_entries)
+    series_allow = [0] * n_buckets
+    series_ask = [0] * n_buckets
+    series_deny = [0] * n_buckets
+    for e in windowed:
+        t = _parse_ts(e.get("ts"))
+        if t is None:
+            continue
+        idx = int((t - start_ts) / bucket_secs)
+        if idx < 0 or idx >= n_buckets:
+            continue
+        dec = (e.get("decision") or "").lower()
+        if dec == "allow":
+            series_allow[idx] += 1
+        elif dec == "ask":
+            series_ask[idx] += 1
+        elif dec == "deny":
+            series_deny[idx] += 1
+
+    return {
+        "window": window,
+        "total": total,
+        "by_decision": {
+            "allow": by_decision.get("allow", 0),
+            "ask":   by_decision.get("ask",   0),
+            "deny":  by_decision.get("deny",  0),
+        },
+        "avg_score": avg_score,
+        "histogram": histogram,
+        "top_rules": top_rules,
+        "tuning_candidates": tuning_candidates,
+        "projects": projects,
+        "timeseries": {
+            "buckets": n_buckets,
+            "bucket_seconds": bucket_secs,
+            "start": start_ts,
+            "allow": series_allow,
+            "ask":   series_ask,
+            "deny":  series_deny,
+        },
+        "log_present": True,
+    }
 
 
 # ============================================================================
@@ -142,20 +327,22 @@ def tail_thread(hub: Hub) -> None:
 # ============================================================================
 
 class DashboardHandler(BaseHTTPRequestHandler):
-    hub: Hub = None  # set on the class before serving
+    log_path: Path = None  # set on class before serve_forever
 
     def log_message(self, fmt: str, *args) -> None:  # noqa: A003
-        # Silence per-request stderr noise. Errors still surface elsewhere.
-        return
+        return  # quiet by design
 
     def do_GET(self) -> None:  # noqa: N802
-        if self.path == "/" or self.path.startswith("/?"):
+        parsed = urlsplit(self.path)
+        if parsed.path in ("/", "/index.html"):
             self._serve_html()
-        elif self.path == "/history":
-            self._serve_history()
-        elif self.path == "/events":
-            self._serve_sse()
-        elif self.path == "/favicon.ico":
+        elif parsed.path == "/api/stats":
+            self._serve_stats(parse_qs(parsed.query))
+        elif parsed.path == "/api/decisions":
+            self._serve_decisions(parse_qs(parsed.query))
+        elif parsed.path == "/api/health":
+            self._serve_json({"ok": True, "log_path": str(self.log_path)})
+        elif parsed.path == "/favicon.ico":
             self.send_response(HTTPStatus.NO_CONTENT)
             self.end_headers()
         else:
@@ -170,58 +357,80 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _serve_history(self) -> None:
-        entries = self.hub.read_history(HISTORY_LIMIT)
-        body = json.dumps({
-            "entries": entries,
-            "log_path": str(self.hub.log_path),
-        }).encode("utf-8")
+    def _serve_stats(self, params: dict) -> None:
+        window = _qparam(params, "window", "24h")
+        if window not in WINDOWS:
+            window = "24h"
+        entries = read_audit_log(self.log_path)
+        if not entries:
+            self._serve_json({
+                "window": window,
+                "total": 0,
+                "by_decision": {"allow": 0, "ask": 0, "deny": 0},
+                "avg_score": 0.0,
+                "histogram": [0] * HISTOGRAM_BUCKETS,
+                "top_rules": [],
+                "tuning_candidates": [],
+                "projects": [],
+                "timeseries": {"buckets": 0, "bucket_seconds": 0,
+                               "start": 0, "allow": [], "ask": [], "deny": []},
+                "log_present": self.log_path.exists(),
+                "log_path": str(self.log_path),
+            })
+            return
+        stats = compute_stats(entries, window)
+        stats["log_path"] = str(self.log_path)
+        self._serve_json(stats)
+
+    def _serve_decisions(self, params: dict) -> None:
+        window = _qparam(params, "window", "24h")
+        if window not in WINDOWS:
+            window = "24h"
+        decision_filter = _qparam(params, "filter", "all").lower()
+        query = _qparam(params, "q", "")
+        try:
+            limit = max(1, min(int(_qparam(params, "limit", str(DECISION_LIMIT))), 2000))
+        except (TypeError, ValueError):
+            limit = DECISION_LIMIT
+
+        entries = read_audit_log(self.log_path)
+        entries = filter_by_window(entries, window)
+        entries = filter_decisions(entries, decision_filter, query)
+        # Newest first, capped to limit.
+        entries.reverse()
+        self._serve_json({
+            "entries": entries[:limit],
+            "total_matched": len(entries),
+            "window": window,
+            "filter": decision_filter,
+            "q": query,
+        })
+
+    def _serve_json(self, payload: dict) -> None:
+        body = json.dumps(payload, default=str).encode("utf-8")
         self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
 
-    def _serve_sse(self) -> None:
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Connection", "keep-alive")
-        self.send_header("X-Accel-Buffering", "no")
-        self.end_headers()
-        q = self.hub.subscribe()
-        try:
-            # Initial ping so the browser fires onopen immediately.
-            self._write_sse({"type": "hello", "ts": time.time()})
-            while not self.hub.shutdown_event.is_set():
-                try:
-                    entry = q.get(timeout=15)
-                except queue.Empty:
-                    # Heartbeat keeps the connection alive through proxies.
-                    try:
-                        self.wfile.write(b": keepalive\n\n")
-                        self.wfile.flush()
-                    except (BrokenPipeError, ConnectionResetError, OSError):
-                        return
-                    continue
-                if not self._write_sse(entry):
-                    return
-        finally:
-            self.hub.unsubscribe(q)
 
-    def _write_sse(self, payload: dict) -> bool:
+def _qparam(params: dict, key: str, default: str) -> str:
+    values = params.get(key)
+    if not values:
+        return default
+    v = values[0]
+    if isinstance(v, bytes):
         try:
-            data = json.dumps(payload, default=str)
-            self.wfile.write(b"data: " + data.encode("utf-8") + b"\n\n")
-            self.wfile.flush()
-            return True
-        except (BrokenPipeError, ConnectionResetError, OSError):
-            return False
+            v = v.decode("utf-8", errors="replace")
+        except Exception:
+            return default
+    return v
 
 
 # ============================================================================
-# Embedded frontend
+# Embedded frontend (HTML + CSS + JS)
 # ============================================================================
 
 INDEX_HTML = r"""<!DOCTYPE html>
@@ -231,281 +440,379 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>claude-guard dashboard</title>
 <meta name="color-scheme" content="dark">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400..900&family=IBM+Plex+Mono:wght@300;400;500;600&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
 <style>
 :root {
   --bg:           #0b0c0e;
-  --bg-elev:      #131418;
-  --bg-elev-2:    #191b20;
-  --bg-elev-3:    #20242a;
-  --fg:           #e8e2d3;
-  --fg-dim:       #b6b0a3;
-  --fg-soft:      #8a8479;
-  --fg-faint:     #5a554d;
-  --accent:       #d4a05a;
-  --accent-soft:  #b88847;
-  --accent-tint:  rgba(212, 160, 90, 0.10);
-  --good:         #8aa66f;
-  --warn:         #d4a05a;
-  --bad:          #b85847;
-  --border:       #262a31;
-  --border-soft:  #1b1e23;
-  --border-strong:#3d434c;
-  --font-display: 'Fraunces', Georgia, serif;
-  --font-sans:    'IBM Plex Sans', system-ui, sans-serif;
-  --font-mono:    'IBM Plex Mono', Menlo, Consolas, monospace;
+  --bg-elev:      #14161a;
+  --bg-elev-2:    #1a1d22;
+  --bg-elev-3:    #22262d;
+  --fg:           #ece6d7;   /* >= 14:1 on bg */
+  --fg-dim:       #c0bcb0;   /* >= 8.5:1 on bg */
+  --fg-soft:      #968f80;   /* >= 5.4:1 on bg, passes AA for normal text */
+  --fg-faint:     #5d574e;   /* decorative only */
+  --accent:       #e2b06b;   /* >= 9:1 on bg */
+  --accent-soft:  #b88c4f;
+  --accent-tint:  rgba(226, 176, 107, 0.10);
+  --good:         #9bbd80;   /* >= 8:1 on bg */
+  --warn:         #e2b06b;
+  --bad:          #d27466;   /* >= 6.5:1 on bg */
+  --bad-tint:     rgba(210, 116, 102, 0.12);
+  --good-tint:    rgba(155, 189, 128, 0.12);
+  --warn-tint:    rgba(226, 176, 107, 0.10);
+  --border:       #2a2e36;
+  --border-soft:  #1e2127;
+  --border-strong:#42485200;
+
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "Cascadia Code", "Roboto Mono", Menlo, Consolas, monospace;
 }
+
 *, *::before, *::after { box-sizing: border-box; }
-html, body { background: var(--bg); color: var(--fg); margin: 0; min-height: 100vh; }
+html, body { margin: 0; background: var(--bg); color: var(--fg); }
 body {
-  font-family: var(--font-sans); font-size: 14px; line-height: 1.5;
+  font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 1.5;
+  min-height: 100vh;
   background:
-    radial-gradient(900px 500px at 20% -200px, rgba(212, 160, 90, 0.06), transparent 60%),
-    radial-gradient(700px 350px at 90% 5%, rgba(138, 166, 111, 0.04), transparent 60%),
+    radial-gradient(900px 500px at 15% -240px, rgba(226, 176, 107, 0.05), transparent 60%),
+    radial-gradient(700px 350px at 90% 0%, rgba(155, 189, 128, 0.03), transparent 60%),
     var(--bg);
   background-attachment: fixed;
 }
 
-/* statusbar (matches landing page) */
+button { font: inherit; color: inherit; background: none; border: 0; padding: 0; cursor: pointer; }
+button:focus-visible, input:focus-visible, [tabindex]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* ─── status bar ───────────────────────────────────────────── */
 .statusbar {
   position: sticky; top: 0; z-index: 50;
   display: flex; align-items: center; gap: 0.85rem;
-  padding: 0.55rem 1.25rem;
+  padding: 0.5rem 1rem;
   background: rgba(11, 12, 14, 0.85);
   backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
   border-bottom: 1px solid var(--border-soft);
-  font-family: var(--font-mono); font-size: 0.78rem; color: var(--fg-soft);
+  font-family: var(--font-mono); font-size: 0.75rem; color: var(--fg-soft);
 }
-.statusbar .dots { display: inline-flex; gap: 0.4rem; }
-.statusbar .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--fg-faint); }
+.statusbar .dots { display: inline-flex; gap: 0.35rem; }
+.statusbar .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--fg-faint); }
 .statusbar .dot.red { background: var(--bad); }
 .statusbar .dot.amber { background: var(--accent); }
 .statusbar .dot.green { background: var(--good); }
 .statusbar .path { color: var(--fg-dim); }
 .statusbar .spacer { flex: 1; }
-.statusbar .ver { color: var(--accent); }
-.statusbar .conn-dot {
+.statusbar .ver { color: var(--accent); font-weight: 500; }
+.live {
+  display: inline-flex; align-items: center; gap: 0.35rem;
+  color: var(--fg-soft);
+}
+.live-pip {
   width: 8px; height: 8px; border-radius: 50%;
-  background: var(--fg-faint);
-  box-shadow: 0 0 0 0 transparent;
-  transition: background 0.3s ease, box-shadow 0.3s ease;
-}
-.statusbar .conn-dot.live {
   background: var(--good);
-  box-shadow: 0 0 0 3px rgba(138, 166, 111, 0.15);
+  box-shadow: 0 0 0 4px rgba(155, 189, 128, 0.12);
+  animation: pulse 1.8s ease-in-out infinite;
 }
-.statusbar .conn-dot.stale { background: var(--bad); }
+.live.stale .live-pip {
+  background: var(--bad);
+  box-shadow: 0 0 0 4px var(--bad-tint);
+  animation: none;
+}
+.live.idle .live-pip { animation: none; opacity: 0.6; }
+@keyframes pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%      { opacity: 0.55; transform: scale(0.85); }
+}
 
-/* layout */
+/* ─── layout ───────────────────────────────────────────────── */
 .app {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 320px;
-  gap: 1.5rem;
-  padding: 1.5rem;
-  max-width: 1400px;
+  grid-template-columns: minmax(0, 1fr) 340px;
+  gap: 1.25rem;
+  padding: 1.25rem;
+  max-width: 1500px;
   margin: 0 auto;
 }
-@media (max-width: 900px) {
+@media (max-width: 960px) {
   .app { grid-template-columns: 1fr; }
 }
 
 h1 {
-  font-family: var(--font-display);
-  font-variation-settings: "opsz" 96, "wght" 500;
-  font-size: 2rem;
-  margin: 0 0 0.25rem;
-  letter-spacing: -0.02em;
+  font-family: var(--font-sans);
+  font-weight: 600;
+  font-size: 1.45rem;
+  margin: 0;
+  letter-spacing: -0.01em;
 }
-.subhead { color: var(--fg-dim); font-size: 0.95rem; margin: 0 0 1.5rem; }
+.subhead { color: var(--fg-dim); font-size: 0.85rem; margin: 0.2rem 0 1.2rem; }
 
-/* metric cards */
+/* ─── window pill bar ──────────────────────────────────────── */
+.window-bar {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0.2rem;
+  margin-bottom: 1rem;
+}
+.window-bar button {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  padding: 0.38rem 0.85rem;
+  border-radius: 999px;
+  color: var(--fg-soft);
+  transition: color 0.12s ease, background 0.12s ease;
+}
+.window-bar button:hover { color: var(--fg); }
+.window-bar button[aria-pressed="true"] {
+  background: var(--accent-tint);
+  color: var(--accent);
+}
+
+/* ─── metric tiles ─────────────────────────────────────────── */
 .metrics {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 0.75rem;
-  margin-bottom: 1.5rem;
+  margin-bottom: 1rem;
 }
+@media (max-width: 720px) { .metrics { grid-template-columns: repeat(2, 1fr); } }
+
 .metric {
   background: var(--bg-elev);
   border: 1px solid var(--border);
   border-radius: 8px;
-  padding: 0.9rem 1rem;
+  padding: 0.7rem 0.85rem;
   position: relative;
 }
 .metric .label {
   font-family: var(--font-mono);
-  font-size: 0.7rem;
+  font-size: 0.66rem;
   text-transform: uppercase;
   letter-spacing: 0.12em;
   color: var(--fg-soft);
   margin-bottom: 0.4rem;
 }
 .metric .value {
-  font-family: var(--font-display);
-  font-variation-settings: "opsz" 48, "wght" 500;
-  font-size: 1.75rem;
+  font-family: var(--font-sans);
+  font-weight: 500;
+  font-size: 1.55rem;
   line-height: 1;
   color: var(--fg);
+  font-variant-numeric: tabular-nums;
 }
 .metric.allow .value { color: var(--good); }
-.metric.ask .value { color: var(--warn); }
-.metric.deny .value { color: var(--bad); }
+.metric.ask .value   { color: var(--warn); }
+.metric.deny .value  { color: var(--bad); }
 .metric .delta {
   font-family: var(--font-mono);
-  font-size: 0.72rem;
+  font-size: 0.68rem;
   color: var(--fg-faint);
   margin-top: 0.25rem;
 }
 
-/* filter bar */
-.filters {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.5rem;
+/* ─── cards / panels ──────────────────────────────────────── */
+.card {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 10px;
   margin-bottom: 1rem;
+  overflow: hidden;
+}
+.card-head {
+  padding: 0.55rem 0.9rem;
+  display: flex;
   align-items: center;
+  gap: 0.75rem;
+  border-bottom: 1px solid var(--border-soft);
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--fg-soft);
+}
+.card-head .spacer { flex: 1; }
+.card-body { padding: 0.9rem; }
+
+/* ─── score histogram ─────────────────────────────────────── */
+.histogram {
+  display: grid;
+  grid-template-columns: repeat(10, 1fr);
+  gap: 0.35rem;
+  align-items: end;
+  height: 95px;
+  padding: 0 0.2rem;
+}
+.bar {
+  position: relative;
+  background: var(--bg-elev-3);
+  border-radius: 3px 3px 0 0;
+  min-height: 2px;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: 0.25rem;
+  cursor: default;
+}
+.bar.lo { background: var(--good); opacity: 0.85; }
+.bar.mid { background: var(--warn); opacity: 0.85; }
+.bar.hi { background: var(--bad); opacity: 0.9; }
+.bar .bar-count {
+  position: absolute;
+  top: -1.1rem;
+  font-family: var(--font-mono);
+  font-size: 0.65rem;
+  color: var(--fg-dim);
+  font-variant-numeric: tabular-nums;
+}
+.bar .bar-label {
+  position: absolute;
+  bottom: -1.2rem;
+  font-family: var(--font-mono);
+  font-size: 0.6rem;
+  color: var(--fg-faint);
+  letter-spacing: 0.04em;
+}
+.histogram-wrap { padding: 0 0 1.7rem; }
+
+/* ─── timeseries sparkline (svg) ──────────────────────────── */
+.spark {
+  width: 100%;
+  height: 64px;
+  display: block;
+}
+.spark-grid { stroke: var(--border-soft); stroke-width: 1; }
+.spark-stack-allow { fill: var(--good); opacity: 0.5; }
+.spark-stack-ask   { fill: var(--warn); opacity: 0.65; }
+.spark-stack-deny  { fill: var(--bad);  opacity: 0.85; }
+.spark-label {
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+  fill: var(--fg-soft);
+}
+
+/* ─── filter row ──────────────────────────────────────────── */
+.filters {
+  display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center;
+  margin-bottom: 0.75rem;
 }
 .chip {
   font-family: var(--font-mono);
-  font-size: 0.74rem;
+  font-size: 0.7rem;
   text-transform: uppercase;
   letter-spacing: 0.1em;
-  padding: 0.35rem 0.75rem;
+  padding: 0.32rem 0.75rem;
   border-radius: 999px;
   border: 1px solid var(--border);
   background: var(--bg-elev);
   color: var(--fg-soft);
-  cursor: pointer;
-  transition: all 0.15s ease;
+  transition: color 0.12s ease, background 0.12s ease, border-color 0.12s ease;
 }
 .chip:hover { color: var(--fg); border-color: var(--border-strong); }
-.chip.active {
+.chip[aria-pressed="true"] {
   background: var(--accent-tint);
   border-color: var(--accent-soft);
   color: var(--accent);
 }
+.chip.allow[aria-pressed="true"] { background: var(--good-tint); border-color: var(--good); color: var(--good); }
+.chip.ask[aria-pressed="true"]   { background: var(--warn-tint); border-color: var(--warn); color: var(--warn); }
+.chip.deny[aria-pressed="true"]  { background: var(--bad-tint);  border-color: var(--bad);  color: var(--bad); }
+
 .search {
   flex: 1;
   min-width: 200px;
-  padding: 0.45rem 0.75rem;
+  padding: 0.42rem 0.7rem;
   border-radius: 6px;
   border: 1px solid var(--border);
   background: var(--bg-elev);
   color: var(--fg);
   font-family: var(--font-mono);
-  font-size: 0.82rem;
-  outline: none;
+  font-size: 0.78rem;
 }
-.search:focus { border-color: var(--accent-soft); }
+.search::placeholder { color: var(--fg-faint); }
 
-/* feed */
-.feed-card {
-  background: var(--bg-elev);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  overflow: hidden;
-}
-.feed-head {
-  padding: 0.65rem 1rem;
-  display: flex;
-  align-items: center;
-  gap: 0.75rem;
-  border-bottom: 1px solid var(--border-soft);
-  font-family: var(--font-mono);
-  font-size: 0.74rem;
-  text-transform: uppercase;
-  letter-spacing: 0.12em;
-  color: var(--fg-soft);
-}
-.feed-head .live-pip {
-  width: 6px; height: 6px; border-radius: 50%;
-  background: var(--good);
-  animation: pulse 1.6s ease-in-out infinite;
-}
-@keyframes pulse {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.3; }
-}
-
-.feed { max-height: 70vh; overflow-y: auto; }
+/* ─── decision feed ───────────────────────────────────────── */
+.feed { max-height: 60vh; overflow-y: auto; }
 .feed::-webkit-scrollbar { width: 8px; }
-.feed::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 4px; }
+.feed::-webkit-scrollbar-thumb { background: var(--bg-elev-3); border-radius: 4px; }
 .feed::-webkit-scrollbar-track { background: transparent; }
 
 .row {
   display: grid;
-  grid-template-columns: 80px 70px 70px 1fr 60px;
-  gap: 0.75rem;
+  grid-template-columns: 70px 60px 90px 1fr 50px;
+  gap: 0.7rem;
   align-items: center;
-  padding: 0.55rem 1rem;
+  padding: 0.45rem 0.9rem;
   border-bottom: 1px solid var(--border-soft);
   font-family: var(--font-mono);
-  font-size: 0.82rem;
+  font-size: 0.78rem;
   cursor: pointer;
   transition: background 0.1s ease;
 }
-.row:hover { background: var(--bg-elev-2); }
-.row.flash { animation: flash 1.2s ease-out; }
-@keyframes flash {
-  0% { background: var(--accent-tint); }
-  100% { background: transparent; }
-}
-.row .ts { color: var(--fg-soft); font-size: 0.74rem; }
+.row:hover, .row:focus-visible { background: var(--bg-elev-2); }
+.row .ts { color: var(--fg-soft); font-size: 0.7rem; font-variant-numeric: tabular-nums; }
 .row .decision {
   font-weight: 600;
-  font-size: 0.72rem;
+  font-size: 0.68rem;
   letter-spacing: 0.08em;
+  display: inline-block;
+  padding: 0.1rem 0.35rem;
+  border-radius: 3px;
+  text-align: center;
+  border: 1px solid transparent;
 }
-.row.allow .decision { color: var(--good); }
-.row.ask .decision   { color: var(--warn); }
-.row.deny .decision  { color: var(--bad); }
+.row.allow .decision { color: var(--good); border-color: rgba(155, 189, 128, 0.35); background: var(--good-tint); }
+.row.ask .decision   { color: var(--warn); border-color: rgba(226, 176, 107, 0.35); background: var(--warn-tint); }
+.row.deny .decision  { color: var(--bad);  border-color: rgba(210, 116, 102, 0.35); background: var(--bad-tint); }
 .row .tool {
   color: var(--fg-dim);
-  font-size: 0.74rem;
+  font-size: 0.7rem;
   text-transform: uppercase;
-  letter-spacing: 0.06em;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  letter-spacing: 0.05em;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .row .summary {
   color: var(--fg);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .row .score {
-  text-align: right;
-  color: var(--fg-soft);
+  text-align: right; color: var(--fg-soft);
   font-variant-numeric: tabular-nums;
 }
 .row.allow .score { color: var(--good); }
 .row.ask .score   { color: var(--warn); }
 .row.deny .score  { color: var(--bad); }
+.row[aria-expanded="true"] { background: var(--bg-elev-2); }
 
 .row-detail {
   display: none;
-  padding: 1rem 1rem 1.25rem 1rem;
+  padding: 0.9rem 0.9rem 1.1rem 0.9rem;
   background: var(--bg-elev-2);
   border-bottom: 1px solid var(--border-soft);
   font-family: var(--font-mono);
-  font-size: 0.78rem;
+  font-size: 0.75rem;
   color: var(--fg-dim);
 }
-.row.open + .row-detail { display: block; }
+.row[aria-expanded="true"] + .row-detail { display: block; }
 .row-detail .field { margin-bottom: 0.5rem; }
 .row-detail .field-label {
   color: var(--fg-soft);
   text-transform: uppercase;
-  font-size: 0.68rem;
+  font-size: 0.62rem;
   letter-spacing: 0.1em;
   margin-bottom: 0.2rem;
 }
 .row-detail pre {
   margin: 0;
-  padding: 0.5rem 0.75rem;
+  padding: 0.45rem 0.65rem;
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: 4px;
@@ -516,7 +823,7 @@ h1 {
 .row-detail .signal {
   display: flex;
   gap: 0.6rem;
-  padding: 0.25rem 0;
+  padding: 0.22rem 0;
   border-top: 1px solid var(--border-soft);
 }
 .row-detail .signal:first-of-type { border-top: 0; }
@@ -528,195 +835,404 @@ h1 {
 .row-detail .signal-pts.pos { color: var(--bad); }
 .row-detail .signal-pts.neg { color: var(--good); }
 .row-detail .signal-pts.zero { color: var(--fg-soft); }
-.row-detail .signal-name { color: var(--accent); min-width: 14rem; }
+.row-detail .signal-name { color: var(--accent); min-width: 12rem; }
 .row-detail .signal-reason { color: var(--fg-dim); flex: 1; }
 
-.empty-state {
-  padding: 3rem 1rem;
+.empty {
+  padding: 2rem 1rem;
   text-align: center;
   color: var(--fg-soft);
   font-family: var(--font-mono);
-  font-size: 0.85rem;
+  font-size: 0.8rem;
+}
+.empty .hint {
+  margin-top: 0.5rem;
+  color: var(--fg-faint);
+  font-size: 0.72rem;
 }
 
-/* sidebar */
+/* ─── sidebar ─────────────────────────────────────────────── */
 .sidebar { display: flex; flex-direction: column; gap: 1rem; }
-.panel {
-  background: var(--bg-elev);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  padding: 1rem;
-}
-.panel h3 {
-  font-family: var(--font-sans);
-  font-size: 0.72rem;
-  text-transform: uppercase;
-  letter-spacing: 0.14em;
-  font-weight: 500;
-  color: var(--fg-soft);
-  margin: 0 0 0.75rem;
-}
-.rule-row {
+.sidebar .card-body { padding: 0.5rem 0.9rem 0.7rem; }
+
+.list-row {
   display: flex;
   justify-content: space-between;
   align-items: center;
   padding: 0.3rem 0;
   font-family: var(--font-mono);
-  font-size: 0.78rem;
+  font-size: 0.74rem;
   color: var(--fg-dim);
   border-bottom: 1px solid var(--border-soft);
+  gap: 0.5rem;
 }
-.rule-row:last-child { border-bottom: 0; }
-.rule-row .rule-name {
+.list-row:last-child { border-bottom: 0; }
+.list-row .name {
   color: var(--fg);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  margin-right: 0.5rem;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  flex: 1; min-width: 0;
 }
-.rule-row .rule-count {
+.list-row .count {
   font-variant-numeric: tabular-nums;
   color: var(--accent);
   min-width: 1.5rem;
   text-align: right;
 }
 
-.spark {
-  width: 100%;
-  height: 56px;
-  display: block;
-}
-.spark-axis { stroke: var(--border); stroke-width: 1; }
-.spark-line { fill: none; stroke: var(--accent); stroke-width: 1.5; }
-.spark-area { fill: var(--accent-tint); }
-.spark-label {
+.tuning-row {
+  padding: 0.4rem 0;
+  border-bottom: 1px solid var(--border-soft);
   font-family: var(--font-mono);
+  font-size: 0.74rem;
+}
+.tuning-row:last-child { border-bottom: 0; }
+.tuning-row .head {
+  display: flex; justify-content: space-between; gap: 0.5rem;
+  color: var(--fg);
+}
+.tuning-row .head .cluster {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  flex: 1; min-width: 0;
+}
+.tuning-row .head .count { color: var(--warn); font-variant-numeric: tabular-nums; }
+.tuning-row .example {
+  margin-top: 0.2rem;
+  color: var(--fg-soft);
   font-size: 0.68rem;
-  fill: var(--fg-soft);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+.muted {
+  color: var(--fg-faint);
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  padding: 0.3rem 0;
+}
+
+/* visually-hidden helper for sr-only text */
+.sr-only {
+  position: absolute; width: 1px; height: 1px;
+  padding: 0; margin: -1px; overflow: hidden;
+  clip: rect(0,0,0,0); white-space: nowrap; border: 0;
 }
 </style>
 </head>
 <body>
 
-<header class="statusbar">
-  <span class="dots">
+<header class="statusbar" role="banner">
+  <span class="dots" aria-hidden="true">
     <span class="dot red"></span><span class="dot amber"></span><span class="dot green"></span>
   </span>
-  <span class="path" id="log-path">~/.claude/guard/audit.jsonl</span>
+  <span class="path" id="log-path" aria-label="audit log location">~/.claude/guard/audit.jsonl</span>
   <span class="spacer"></span>
-  <span class="conn-dot" id="conn-dot"></span>
-  <span id="conn-label">connecting…</span>
-  <span class="ver">v3</span>
+  <span class="live idle" id="live" aria-live="polite">
+    <span class="live-pip" aria-hidden="true"></span>
+    <span id="live-label">connecting…</span>
+  </span>
+  <span class="ver" aria-label="version">v3</span>
 </header>
 
-<main class="app">
-  <section>
-    <h1>claude-guard</h1>
-    <p class="subhead">Live decisions from Claude Code's PreToolUse hook. Click any row to see the full signal breakdown.</p>
+<main class="app" id="app">
+  <section aria-labelledby="title">
+    <h1 id="title">claude-guard</h1>
+    <p class="subhead">Live decisions from Claude Code's PreToolUse hook. Click any row to expand the full signal breakdown.</p>
 
-    <div class="metrics">
-      <div class="metric allow">
-        <div class="label">allow (last 200)</div>
+    <div class="window-bar" role="group" aria-label="Time window">
+      <button data-window="1h"  aria-pressed="false">1h</button>
+      <button data-window="24h" aria-pressed="true">24h</button>
+      <button data-window="7d"  aria-pressed="false">7d</button>
+      <button data-window="all" aria-pressed="false">all</button>
+    </div>
+
+    <div class="metrics" role="group" aria-label="Decision totals">
+      <div class="metric" aria-label="Total decisions">
+        <div class="label">Total</div>
+        <div class="value" id="m-total">0</div>
+        <div class="delta" id="m-window-label">last 24h</div>
+      </div>
+      <div class="metric allow" aria-label="Allow count">
+        <div class="label">Allow</div>
         <div class="value" id="m-allow">0</div>
-        <div class="delta" id="d-allow">—</div>
+        <div class="delta" id="m-allow-pct">—</div>
       </div>
-      <div class="metric ask">
-        <div class="label">ask</div>
+      <div class="metric ask" aria-label="Ask count">
+        <div class="label">Ask</div>
         <div class="value" id="m-ask">0</div>
-        <div class="delta" id="d-ask">—</div>
+        <div class="delta" id="m-ask-pct">—</div>
       </div>
-      <div class="metric deny">
-        <div class="label">deny</div>
+      <div class="metric deny" aria-label="Deny count">
+        <div class="label">Deny</div>
         <div class="value" id="m-deny">0</div>
-        <div class="delta" id="d-deny">—</div>
+        <div class="delta" id="m-deny-pct">—</div>
       </div>
-      <div class="metric">
-        <div class="label">per minute</div>
-        <div class="value" id="m-rate">0</div>
-        <div class="delta" id="d-rate">live</div>
+      <div class="metric" aria-label="Average score">
+        <div class="label">Avg Score</div>
+        <div class="value" id="m-avg">0</div>
+        <div class="delta">0 = silent · 100 = denied</div>
       </div>
     </div>
 
-    <div class="filters">
-      <button class="chip active" data-filter="all">all</button>
-      <button class="chip" data-filter="allow">allow</button>
-      <button class="chip" data-filter="ask">ask</button>
-      <button class="chip" data-filter="deny">deny</button>
-      <input class="search" id="search" placeholder="filter by command, tool, rule…" />
+    <div class="card">
+      <div class="card-head">
+        <span>score distribution</span>
+        <span class="spacer"></span>
+        <span class="muted" id="hist-summary"></span>
+      </div>
+      <div class="card-body histogram-wrap">
+        <div class="histogram" id="hist" role="img" aria-label="Score distribution histogram"></div>
+      </div>
     </div>
 
-    <div class="feed-card">
-      <div class="feed-head">
-        <span class="live-pip"></span>
+    <div class="card">
+      <div class="card-head">
+        <span>decisions over window</span>
+        <span class="spacer"></span>
+        <span class="muted" id="ts-summary"></span>
+      </div>
+      <div class="card-body">
+        <svg class="spark" id="spark" viewBox="0 0 600 64" preserveAspectRatio="none"
+             role="img" aria-label="Decisions per time bucket"></svg>
+      </div>
+    </div>
+
+    <div class="filters" role="group" aria-label="Filter the live feed">
+      <button class="chip" data-filter="all"   aria-pressed="true">all</button>
+      <button class="chip allow" data-filter="allow" aria-pressed="false">allow</button>
+      <button class="chip ask"   data-filter="ask"   aria-pressed="false">ask</button>
+      <button class="chip deny"  data-filter="deny"  aria-pressed="false">deny</button>
+      <label class="sr-only" for="search">Search</label>
+      <input class="search" id="search" type="search"
+             placeholder="search command, tool, project, rule…"
+             autocomplete="off" />
+    </div>
+
+    <div class="card">
+      <div class="card-head">
         <span>live feed</span>
-        <span class="spacer" style="flex:1"></span>
-        <span id="feed-count">0 shown</span>
+        <span class="spacer"></span>
+        <span class="muted" id="feed-count">0 shown</span>
       </div>
       <div class="feed" id="feed">
-        <div class="empty-state" id="empty">waiting for activity… run any Bash/Edit/Write/Web/MCP tool in Claude Code to see it appear here.</div>
+        <div class="empty" id="empty">
+          <div>waiting for activity…</div>
+          <div class="hint">run any Bash, Edit, Write, WebFetch, WebSearch, or MCP tool in Claude Code to see it appear here.</div>
+        </div>
       </div>
     </div>
   </section>
 
-  <aside class="sidebar">
-    <div class="panel">
-      <h3>decisions / min</h3>
-      <svg class="spark" id="spark" viewBox="0 0 300 56" preserveAspectRatio="none"></svg>
+  <aside class="sidebar" aria-label="Aggregates">
+    <div class="card">
+      <div class="card-head"><span>top firing rules</span></div>
+      <div class="card-body" id="top-rules"><div class="muted">no signals yet</div></div>
     </div>
-    <div class="panel">
-      <h3>top firing rules</h3>
-      <div id="top-rules"><div class="rule-row" style="color: var(--fg-faint)">no signals yet</div></div>
+    <div class="card">
+      <div class="card-head"><span>tuning candidates</span></div>
+      <div class="card-body" id="tuning">
+        <div class="muted">no repeated ask-band clusters yet — the dashboard will surface command shapes that hit the ask band multiple times so you can promote them to allow or deny.</div>
+      </div>
     </div>
-    <div class="panel">
-      <h3>top tools</h3>
-      <div id="top-tools"><div class="rule-row" style="color: var(--fg-faint)">no tools yet</div></div>
+    <div class="card" id="projects-card" hidden>
+      <div class="card-head"><span>projects</span></div>
+      <div class="card-body" id="projects"></div>
     </div>
   </aside>
 </main>
 
 <script>
-const state = {
-  entries: [],          // newest-first
-  filter: "all",
-  search: "",
-};
-const MAX_ENTRIES = 500;
-
+const POLL_MS = 2000;
+const FEED_LIMIT = 200;
 const $ = (id) => document.getElementById(id);
-const feedEl = $("feed");
-const emptyEl = $("empty");
 
-function fmtTs(ts) {
-  try {
-    const d = new Date(ts);
-    return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
-  } catch { return String(ts); }
+const state = {
+  window:  "24h",
+  filter:  "all",
+  search:  "",
+  entries: [],
+  stats:   null,
+  open:    new Set(),     // expanded rows, keyed by ts+command
+  lastOk:  0,
+  pollPending: false,
+};
+
+const fmt = {
+  ts(s) {
+    try {
+      const d = new Date(s);
+      return d.toLocaleTimeString([], {hour:"2-digit", minute:"2-digit", second:"2-digit", hour12:false});
+    } catch { return String(s); }
+  },
+  esc(s) {
+    return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
+  },
+  shortCmd(s, n=110) {
+    s = s || "";
+    return s.length <= n ? s : s.slice(0, n - 1) + "…";
+  },
+  pct(n, total) {
+    if (!total) return "—";
+    return Math.round((n/total) * 100) + "%";
+  },
+  windowLabel(w) {
+    return ({"1h":"last 1h","24h":"last 24h","7d":"last 7d","all":"all time"})[w] || w;
+  },
+};
+
+function rowKey(e) { return (e.ts || "") + "|" + (e.tool || "") + "|" + (e.command || ""); }
+
+// ─── rendering ─────────────────────────────────────────────────────────
+function render() {
+  renderStats();
+  renderHistogram();
+  renderSparkline();
+  renderFeed();
+  renderSidebar();
 }
 
-function shortSummary(e) {
-  const cmd = e.command || "";
-  if (cmd.length <= 90) return cmd;
-  return cmd.slice(0, 87) + "…";
+function renderStats() {
+  const s = state.stats || {};
+  const bd = s.by_decision || {allow:0, ask:0, deny:0};
+  $("m-total").textContent = (s.total ?? 0).toLocaleString();
+  $("m-window-label").textContent = fmt.windowLabel(state.window);
+  $("m-allow").textContent = (bd.allow ?? 0).toLocaleString();
+  $("m-ask").textContent   = (bd.ask ?? 0).toLocaleString();
+  $("m-deny").textContent  = (bd.deny ?? 0).toLocaleString();
+  $("m-avg").textContent   = (s.avg_score ?? 0).toFixed(1);
+  $("m-allow-pct").textContent = fmt.pct(bd.allow, s.total);
+  $("m-ask-pct").textContent   = fmt.pct(bd.ask,   s.total);
+  $("m-deny-pct").textContent  = fmt.pct(bd.deny,  s.total);
+  if (s.log_path) $("log-path").textContent = s.log_path;
 }
 
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
+function renderHistogram() {
+  const hist = (state.stats && state.stats.histogram) || new Array(10).fill(0);
+  const max  = Math.max(1, ...hist);
+  const labels = ["0–9","10–19","20–29","30–39","40–49","50–59","60–69","70–79","80–89","90–100"];
+  let html = "";
+  for (let i = 0; i < 10; i++) {
+    const h = Math.round((hist[i] / max) * 88);   // 88px of headroom in the 95px row
+    const cls = i < 3 ? "lo" : (i < 6 ? "mid" : "hi");
+    html += `
+      <div class="bar ${cls}" style="height:${Math.max(2, h)}px"
+           role="presentation"
+           title="score ${labels[i]}: ${hist[i]} decisions">
+        ${hist[i] > 0 ? `<span class="bar-count">${hist[i]}</span>` : ""}
+        <span class="bar-label">${labels[i]}</span>
+      </div>`;
+  }
+  $("hist").innerHTML = html;
+  const total = hist.reduce((a,b)=>a+b, 0);
+  $("hist-summary").textContent = `${total} scored decisions · 10 buckets`;
 }
 
-function rowHtml(e, idx) {
-  const decision = (e.decision || "ask").toLowerCase();
-  const score = (typeof e.score === "number") ? e.score : 0;
-  const tool = e.tool || "?";
-  return `
-    <div class="row ${decision}" data-idx="${idx}">
-      <span class="ts">${escapeHtml(fmtTs(e.ts))}</span>
-      <span class="decision">${escapeHtml(decision.toUpperCase())}</span>
-      <span class="tool">${escapeHtml(tool)}</span>
-      <span class="summary">${escapeHtml(shortSummary(e))}</span>
-      <span class="score">${score}</span>
-    </div>
-    <div class="row-detail" data-idx="${idx}">${detailHtml(e)}</div>
+function renderSparkline() {
+  const ts = (state.stats && state.stats.timeseries) || null;
+  const W = 600, H = 64, padX = 6, padY = 6;
+  if (!ts || !ts.buckets) {
+    $("spark").innerHTML = `<text class="spark-label" x="${padX}" y="${H/2}">no data in window</text>`;
+    $("ts-summary").textContent = "";
+    return;
+  }
+  const n = ts.buckets;
+  const allow = ts.allow || new Array(n).fill(0);
+  const ask   = ts.ask   || new Array(n).fill(0);
+  const deny  = ts.deny  || new Array(n).fill(0);
+  const stacked = allow.map((a, i) => a + ask[i] + deny[i]);
+  const max = Math.max(1, ...stacked);
+  const xStep = (W - padX*2) / Math.max(1, n - 1);
+
+  const yFor = (v) => H - padY - (v / max) * (H - padY*2);
+
+  // Build stacked-area paths: bottom -> allow top -> ask top -> deny top.
+  function areaPath(values, baseline) {
+    const top = values.map((v, i) => [padX + i*xStep, yFor(v + (baseline[i] || 0))]);
+    const bot = baseline.map((v, i) => [padX + i*xStep, yFor(v)]).reverse();
+    const all = top.concat(bot);
+    return "M " + all.map(p => `${p[0].toFixed(1)} ${p[1].toFixed(1)}`).join(" L ") + " Z";
+  }
+  const base = new Array(n).fill(0);
+  const allowPath = areaPath(allow, base);
+  const baseAsk   = allow.slice();
+  const askPath   = areaPath(ask, baseAsk);
+  const baseDeny  = allow.map((a, i) => a + ask[i]);
+  const denyPath  = areaPath(deny, baseDeny);
+
+  const startLabel = bucketLabel(ts.start);
+  const endLabel = "now";
+  const peakLabel = `peak ${max}`;
+  $("spark").innerHTML = `
+    <line class="spark-grid" x1="${padX}" y1="${H-padY}" x2="${W-padX}" y2="${H-padY}"/>
+    <path class="spark-stack-allow" d="${allowPath}"></path>
+    <path class="spark-stack-ask"   d="${askPath}"></path>
+    <path class="spark-stack-deny"  d="${denyPath}"></path>
+    <text class="spark-label" x="${padX}" y="${H-1}" text-anchor="start">${fmt.esc(startLabel)}</text>
+    <text class="spark-label" x="${W-padX}" y="${H-1}" text-anchor="end">${endLabel}</text>
+    <text class="spark-label" x="${padX}" y="10">${peakLabel}/bucket</text>
   `;
+  const bucketMinutes = Math.round((ts.bucket_seconds || 0) / 60);
+  $("ts-summary").textContent = `${n} buckets · ~${bucketMinutes}m each`;
+}
+
+function bucketLabel(startTs) {
+  if (!startTs) return "";
+  const d = new Date(startTs * 1000);
+  return d.toLocaleString([], {month:"short", day:"numeric", hour:"2-digit", minute:"2-digit", hour12:false});
+}
+
+function renderFeed() {
+  const feedEl = $("feed");
+  const entries = state.entries || [];
+  if (!entries.length) {
+    feedEl.innerHTML = "";
+    feedEl.appendChild($("empty"));
+    $("empty").hidden = false;
+    $("feed-count").textContent = "0 shown";
+    return;
+  }
+  $("empty").hidden = true;
+  let html = "";
+  for (const e of entries) {
+    const dec = (e.decision || "ask").toLowerCase();
+    const score = (typeof e.score === "number") ? e.score : 0;
+    const key = rowKey(e);
+    const open = state.open.has(key);
+    html += `
+      <div class="row ${dec}" tabindex="0" role="button"
+           aria-expanded="${open ? "true" : "false"}"
+           data-key="${fmt.esc(key)}">
+        <span class="ts">${fmt.esc(fmt.ts(e.ts))}</span>
+        <span class="decision" aria-label="decision ${dec}">${dec.toUpperCase()}</span>
+        <span class="tool">${fmt.esc(e.tool || "?")}</span>
+        <span class="summary">${fmt.esc(fmt.shortCmd(e.command || ""))}</span>
+        <span class="score">${score}</span>
+      </div>
+      <div class="row-detail">${detailHtml(e)}</div>
+    `;
+  }
+  feedEl.innerHTML = html;
+  $("feed-count").textContent = `${entries.length} shown`;
+
+  // Wire up click + keyboard expand.
+  feedEl.querySelectorAll(".row").forEach(row => {
+    row.addEventListener("click", () => toggleRow(row));
+    row.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter" || ev.key === " ") {
+        ev.preventDefault();
+        toggleRow(row);
+      }
+    });
+  });
+}
+
+function toggleRow(row) {
+  const key = row.dataset.key;
+  if (state.open.has(key)) {
+    state.open.delete(key);
+    row.setAttribute("aria-expanded", "false");
+  } else {
+    state.open.add(key);
+    row.setAttribute("aria-expanded", "true");
+  }
 }
 
 function detailHtml(e) {
@@ -727,211 +1243,126 @@ function detailHtml(e) {
     return `
       <div class="signal">
         <span class="signal-pts ${cls}">${sign}${pts}</span>
-        <span class="signal-name">${escapeHtml(s.name || "")}</span>
-        <span class="signal-reason">${escapeHtml(s.reason || "")}</span>
+        <span class="signal-name">${fmt.esc(s.name || "")}</span>
+        <span class="signal-reason">${fmt.esc(s.reason || "")}</span>
       </div>`;
   }).join("");
-  const paths = (e.paths && e.paths.length) ? e.paths.join("\n") : "";
-  const oos = (e.out_of_scope_paths && e.out_of_scope_paths.length) ? e.out_of_scope_paths.join("\n") : "";
-  const nets = (e.network_targets && e.network_targets.length) ? e.network_targets.join("\n") : "";
+  const paths = (e.paths || []).join("\n");
+  const oos = (e.out_of_scope_paths || []).join("\n");
+  const nets = (e.network_targets || []).join("\n");
+  const shell = e.is_powershell ? "powershell" : "bash / posix";
   const timing = e.timing ? `parse ${e.timing.parse_ms}ms · evaluate ${e.timing.evaluate_ms}ms · llm ${e.timing.llm_ms}ms` : "";
   return `
-    <div class="field"><div class="field-label">command</div><pre>${escapeHtml(e.command || "")}</pre></div>
-    <div class="field"><div class="field-label">project dir</div><pre>${escapeHtml(e.project_dir || "")}</pre></div>
-    ${paths ? `<div class="field"><div class="field-label">paths</div><pre>${escapeHtml(paths)}</pre></div>` : ""}
-    ${oos ? `<div class="field"><div class="field-label">out-of-scope paths</div><pre>${escapeHtml(oos)}</pre></div>` : ""}
-    ${nets ? `<div class="field"><div class="field-label">network targets</div><pre>${escapeHtml(nets)}</pre></div>` : ""}
-    <div class="field"><div class="field-label">signals</div>${sigs || '<div style="color: var(--fg-faint)">no signals matched</div>'}</div>
-    ${timing ? `<div class="field"><div class="field-label">timing</div><pre>${escapeHtml(timing)}</pre></div>` : ""}
+    <div class="field"><div class="field-label">command</div><pre>${fmt.esc(e.command || "")}</pre></div>
+    <div class="field"><div class="field-label">project</div><pre>${fmt.esc(e.project_dir || "")}</pre></div>
+    <div class="field"><div class="field-label">shell</div><pre>${fmt.esc(shell)}</pre></div>
+    ${paths ? `<div class="field"><div class="field-label">paths (${(e.paths||[]).length})</div><pre>${fmt.esc(paths)}</pre></div>` : ""}
+    ${oos ? `<div class="field"><div class="field-label">out-of-scope paths</div><pre>${fmt.esc(oos)}</pre></div>` : ""}
+    ${nets ? `<div class="field"><div class="field-label">network targets</div><pre>${fmt.esc(nets)}</pre></div>` : ""}
+    <div class="field"><div class="field-label">signals</div>${sigs || '<div class="muted">no signals matched</div>'}</div>
+    ${timing ? `<div class="field"><div class="field-label">timing</div><pre>${fmt.esc(timing)}</pre></div>` : ""}
   `;
 }
 
-function visible(e) {
-  if (state.filter !== "all" && (e.decision || "").toLowerCase() !== state.filter) return false;
-  if (state.search) {
-    const q = state.search.toLowerCase();
-    const hay = `${e.command || ""} ${e.tool || ""} ${(e.signals || []).map(s => s.name || "").join(" ")}`.toLowerCase();
-    if (!hay.includes(q)) return false;
-  }
-  return true;
-}
+function renderSidebar() {
+  const s = state.stats || {};
+  // Top rules
+  const rules = s.top_rules || [];
+  $("top-rules").innerHTML = rules.length
+    ? rules.map(r => `<div class="list-row"><span class="name">${fmt.esc(r.name)}</span><span class="count">${r.count}</span></div>`).join("")
+    : `<div class="muted">no signals yet</div>`;
 
-function render() {
-  const visibleEntries = state.entries.map((e, i) => ({ e, i })).filter(x => visible(x.e));
-  if (state.entries.length === 0) {
-    emptyEl.style.display = "block";
-    emptyEl.textContent = "waiting for activity… run any Bash/Edit/Write/Web/MCP tool in Claude Code to see it appear here.";
-    feedEl.innerHTML = "";
-    feedEl.appendChild(emptyEl);
-  } else if (visibleEntries.length === 0) {
-    feedEl.innerHTML = `<div class="empty-state">no entries match the current filter.</div>`;
+  // Tuning candidates
+  const tc = s.tuning_candidates || [];
+  $("tuning").innerHTML = tc.length
+    ? tc.map(t => `
+        <div class="tuning-row">
+          <div class="head"><span class="cluster">${fmt.esc(t.cluster)}</span><span class="count">×${t.count}</span></div>
+          <div class="example">${fmt.esc(t.example || "")}</div>
+        </div>`).join("")
+    : `<div class="muted">no repeated ask-band clusters yet — the dashboard will surface command shapes that hit the ask band multiple times so you can promote them to allow or deny.</div>`;
+
+  // Projects (only if >1)
+  const projs = s.projects || [];
+  if (projs.length > 1) {
+    $("projects-card").hidden = false;
+    $("projects").innerHTML = projs.map(p => {
+      const short = (p.path || "").replace(/^.*[\\/]/, "");
+      return `<div class="list-row"><span class="name" title="${fmt.esc(p.path)}">${fmt.esc(short || p.path)}</span><span class="count">${p.count}</span></div>`;
+    }).join("");
   } else {
-    feedEl.innerHTML = visibleEntries.map(x => rowHtml(x.e, x.i)).join("");
+    $("projects-card").hidden = true;
   }
-  $("feed-count").textContent = `${visibleEntries.length} shown · ${state.entries.length} total`;
-
-  // wire up click-to-expand
-  feedEl.querySelectorAll(".row").forEach(row => {
-    row.addEventListener("click", () => row.classList.toggle("open"));
-  });
-
-  updateMetrics();
-  updateSidebar();
 }
 
-function updateMetrics() {
-  let a = 0, k = 0, d = 0;
-  for (const e of state.entries) {
-    const dec = (e.decision || "").toLowerCase();
-    if (dec === "allow") a++;
-    else if (dec === "ask") k++;
-    else if (dec === "deny") d++;
-  }
-  $("m-allow").textContent = a;
-  $("m-ask").textContent = k;
-  $("m-deny").textContent = d;
-
-  // per-minute rate over the last 5 minutes
-  const cutoff = Date.now() - 5 * 60 * 1000;
-  const recent = state.entries.filter(e => {
-    const t = Date.parse(e.ts);
-    return !isNaN(t) && t >= cutoff;
-  });
-  const rate = recent.length / 5;
-  $("m-rate").textContent = rate.toFixed(1);
-}
-
-function updateSidebar() {
-  // top firing rules
-  const ruleCount = {};
-  for (const e of state.entries) {
-    for (const s of (e.signals || [])) {
-      ruleCount[s.name] = (ruleCount[s.name] || 0) + 1;
-    }
-  }
-  const ruleRows = Object.entries(ruleCount)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 10)
-    .map(([name, n]) => `<div class="rule-row"><span class="rule-name">${escapeHtml(name)}</span><span class="rule-count">${n}</span></div>`)
-    .join("");
-  $("top-rules").innerHTML = ruleRows || `<div class="rule-row" style="color: var(--fg-faint)">no signals yet</div>`;
-
-  // top tools
-  const toolCount = {};
-  for (const e of state.entries) {
-    const t = e.tool || "?";
-    toolCount[t] = (toolCount[t] || 0) + 1;
-  }
-  const toolRows = Object.entries(toolCount)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 8)
-    .map(([t, n]) => `<div class="rule-row"><span class="rule-name">${escapeHtml(t)}</span><span class="rule-count">${n}</span></div>`)
-    .join("");
-  $("top-tools").innerHTML = toolRows || `<div class="rule-row" style="color: var(--fg-faint)">no tools yet</div>`;
-
-  // sparkline: decisions per minute over last 30 minutes (30 buckets)
-  drawSparkline();
-}
-
-function drawSparkline() {
-  const buckets = 30;
-  const now = Date.now();
-  const data = new Array(buckets).fill(0);
-  for (const e of state.entries) {
-    const t = Date.parse(e.ts);
-    if (isNaN(t)) continue;
-    const ageMin = Math.floor((now - t) / 60000);
-    if (ageMin >= 0 && ageMin < buckets) {
-      data[buckets - 1 - ageMin]++;
-    }
-  }
-  const W = 300, H = 56, pad = 4;
-  const max = Math.max(1, ...data);
-  const xStep = (W - pad * 2) / (buckets - 1);
-  const points = data.map((v, i) => {
-    const x = pad + i * xStep;
-    const y = H - pad - (v / max) * (H - pad * 2);
-    return [x, y];
-  });
-  const linePath = "M " + points.map(p => `${p[0].toFixed(1)} ${p[1].toFixed(1)}`).join(" L ");
-  const areaPath = linePath + ` L ${(W - pad).toFixed(1)} ${(H - pad).toFixed(1)} L ${pad.toFixed(1)} ${(H - pad).toFixed(1)} Z`;
-  $("spark").innerHTML = `
-    <path class="spark-area" d="${areaPath}"></path>
-    <path class="spark-line" d="${linePath}"></path>
-    <text class="spark-label" x="${pad}" y="${H - 2}" text-anchor="start">30m ago</text>
-    <text class="spark-label" x="${W - pad}" y="${H - 2}" text-anchor="end">now</text>
-    <text class="spark-label" x="${pad}" y="10">peak ${max}/min</text>
-  `;
-}
-
-function pushEntry(e, fromHistory) {
-  state.entries.unshift(e);
-  if (state.entries.length > MAX_ENTRIES) state.entries.pop();
-  if (!fromHistory) {
+// ─── polling ───────────────────────────────────────────────────────────
+async function poll() {
+  if (state.pollPending) return;
+  state.pollPending = true;
+  try {
+    const win = encodeURIComponent(state.window);
+    const filt = encodeURIComponent(state.filter);
+    const q = encodeURIComponent(state.search);
+    const [statsRes, decsRes] = await Promise.all([
+      fetch(`/api/stats?window=${win}`, {cache:"no-store"}),
+      fetch(`/api/decisions?window=${win}&filter=${filt}&q=${q}&limit=${FEED_LIMIT}`, {cache:"no-store"}),
+    ]);
+    if (!statsRes.ok || !decsRes.ok) throw new Error("api error");
+    const [stats, decs] = await Promise.all([statsRes.json(), decsRes.json()]);
+    state.stats = stats;
+    state.entries = decs.entries || [];
+    state.lastOk = Date.now();
+    setLive("live", "live");
     render();
-    // Flash the new row briefly.
-    const row = feedEl.querySelector('.row[data-idx="0"]');
-    if (row) {
-      row.classList.add("flash");
-      setTimeout(() => row.classList.remove("flash"), 1200);
-    }
+  } catch (e) {
+    setLive("stale", "reconnecting…");
+  } finally {
+    state.pollPending = false;
   }
 }
 
-// initial load
-fetch("/history")
-  .then(r => r.json())
-  .then(data => {
-    if (data.log_path) $("log-path").textContent = data.log_path;
-    // /history returns oldest-first; we keep newest-first internally.
-    const entries = (data.entries || []).slice().reverse();
-    state.entries = entries.slice(0, MAX_ENTRIES);
-    render();
-  })
-  .catch(() => render());
-
-// SSE
-let es;
-function connect() {
-  es = new EventSource("/events");
-  es.onopen = () => {
-    $("conn-dot").classList.add("live");
-    $("conn-dot").classList.remove("stale");
-    $("conn-label").textContent = "live";
-  };
-  es.onerror = () => {
-    $("conn-dot").classList.remove("live");
-    $("conn-dot").classList.add("stale");
-    $("conn-label").textContent = "reconnecting…";
-    es.close();
-    setTimeout(connect, 1500);
-  };
-  es.onmessage = (ev) => {
-    try {
-      const payload = JSON.parse(ev.data);
-      if (payload.type === "hello") return;
-      pushEntry(payload, false);
-    } catch (e) { /* ignore */ }
-  };
+function setLive(cls, label) {
+  const el = $("live");
+  el.classList.remove("live", "stale", "idle");
+  el.classList.add(cls);
+  $("live-label").textContent = label;
 }
-connect();
 
-// filter chips
-document.querySelectorAll(".chip").forEach(chip => {
-  chip.addEventListener("click", () => {
-    document.querySelectorAll(".chip").forEach(c => c.classList.remove("active"));
-    chip.classList.add("active");
-    state.filter = chip.dataset.filter;
-    render();
+// ─── input wiring ──────────────────────────────────────────────────────
+document.querySelectorAll(".window-bar button").forEach(b => {
+  b.addEventListener("click", () => {
+    document.querySelectorAll(".window-bar button").forEach(x => x.setAttribute("aria-pressed", "false"));
+    b.setAttribute("aria-pressed", "true");
+    state.window = b.dataset.window;
+    poll();
   });
 });
+document.querySelectorAll(".chip[data-filter]").forEach(b => {
+  b.addEventListener("click", () => {
+    document.querySelectorAll(".chip[data-filter]").forEach(x => x.setAttribute("aria-pressed", "false"));
+    b.setAttribute("aria-pressed", "true");
+    state.filter = b.dataset.filter;
+    poll();
+  });
+});
+let searchDebounce;
 $("search").addEventListener("input", (e) => {
   state.search = e.target.value;
-  render();
+  clearTimeout(searchDebounce);
+  searchDebounce = setTimeout(poll, 200);
 });
 
-// periodic re-render so the sparkline scrolls with time
-setInterval(() => { if (state.entries.length) { updateMetrics(); drawSparkline(); } }, 30000);
+// keyboard: "/" focuses search
+document.addEventListener("keydown", (e) => {
+  if (e.key === "/" && document.activeElement !== $("search")) {
+    e.preventDefault();
+    $("search").focus();
+  }
+});
+
+// Initial poll + interval
+poll();
+setInterval(poll, POLL_MS);
 </script>
 </body>
 </html>
@@ -945,34 +1376,36 @@ setInterval(() => { if (state.entries.length) { updateMetrics(); drawSparkline()
 def main() -> int:
     ap = argparse.ArgumentParser(description="claude-guard live dashboard")
     ap.add_argument("--port", type=int, default=DEFAULT_PORT,
-                    help=f"port to bind (default {DEFAULT_PORT})")
+                    help=f"port to bind on 127.0.0.1 (default {DEFAULT_PORT})")
     ap.add_argument("--log", type=str, default=None,
                     help="path to audit.jsonl (default: next to this script)")
-    ap.add_argument("--no-open", action="store_true",
+    ap.add_argument("--no-browser", action="store_true",
                     help="do not auto-open the browser")
     args = ap.parse_args()
 
     here = Path(__file__).resolve().parent
-    log_path = Path(args.log).expanduser().resolve() if args.log else here / "audit.jsonl"
+    log_path = (
+        Path(args.log).expanduser().resolve()
+        if args.log else here / "audit.jsonl"
+    )
 
     if not log_path.exists():
-        print(f"note: {log_path} does not exist yet — it will be created the first "
-              f"time claude-guard logs a decision.")
+        print(
+            f"note: {log_path} does not exist yet. The dashboard will show an "
+            "empty state and start populating the first time claude-guard "
+            "logs a decision."
+        )
 
-    hub = Hub(log_path)
-    DashboardHandler.hub = hub
-
-    tailer = threading.Thread(target=tail_thread, args=(hub,), daemon=True)
-    tailer.start()
-
+    DashboardHandler.log_path = log_path
     server = ThreadingHTTPServer(("127.0.0.1", args.port), DashboardHandler)
     url = f"http://127.0.0.1:{args.port}"
+
     print(f"claude-guard dashboard -> {url}")
     print(f"watching {log_path}")
     print("Press Ctrl-C to stop.")
 
-    if not args.no_open:
-        def _open():
+    if not args.no_browser:
+        def _open() -> None:
             time.sleep(0.4)
             try:
                 webbrowser.open(url)
@@ -983,9 +1416,8 @@ def main() -> int:
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\nshutting down…")
+        print("\nstopping…")
     finally:
-        hub.shutdown_event.set()
         server.server_close()
     return 0
 
