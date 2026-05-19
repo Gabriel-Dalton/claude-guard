@@ -19,7 +19,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import socket
+import subprocess
 import sys
 import threading
 import time
@@ -1370,6 +1373,157 @@ setInterval(poll, POLL_MS);
 
 
 # ============================================================================
+# --ensure-running: idempotent background launcher
+# ============================================================================
+# Wired in from Claude Code's SessionStart hook so the dashboard is always
+# available without the user typing anything. The hook fires on every session
+# start (startup, resume, /clear, /compact). Behavior:
+#   - PID file alive AND port is accepting connections -> exit silently.
+#   - Port bound by something else (not our PID) -> exit silently (don't
+#     fight whatever owns the port).
+#   - Nothing running -> spawn the foreground server as a detached child
+#     process and exit. The child opens the browser on first launch.
+#
+# The child is the same dashboard.py invoked with --port/--log (and *without*
+# --no-browser, so the user sees the dashboard pop the first time after a
+# reboot / restart).
+
+def _pid_file_for(log_path: Path) -> Path:
+    return log_path.parent / "dashboard.pid"
+
+
+def _read_pid(pid_file: Path) -> int | None:
+    try:
+        return int(pid_file.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _pid_alive(pid: int) -> bool:
+    """Cross-platform liveness check.
+
+    Windows: OpenProcess + GetExitCodeProcess via ctypes (stdlib).
+    POSIX:   os.kill(pid, 0).
+    """
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            handle = kernel32.OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION, False, pid,
+            )
+            if not handle:
+                return False
+            try:
+                exit_code = ctypes.c_ulong()
+                ok = kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
+                if not ok:
+                    return False
+                STILL_ACTIVE = 259
+                return exit_code.value == STILL_ACTIVE
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:
+            return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # process exists but we can't signal it; still alive
+    except OSError:
+        return False
+
+
+def _port_listening(port: int) -> bool:
+    """True if a TCP server is accepting connections on 127.0.0.1:port."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(0.3)
+    try:
+        s.connect(("127.0.0.1", port))
+        return True
+    except OSError:
+        return False
+    finally:
+        try:
+            s.close()
+        except OSError:
+            pass
+
+
+def _spawn_detached(args: list[str]) -> subprocess.Popen | None:
+    """Launch a detached background process. Stdio is fully suppressed."""
+    kwargs = dict(
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+        close_fds=True,
+    )
+    if os.name == "nt":
+        DETACHED_PROCESS = 0x00000008
+        CREATE_NEW_PROCESS_GROUP = 0x00000200
+        kwargs["creationflags"] = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+    else:
+        kwargs["start_new_session"] = True
+    try:
+        return subprocess.Popen(args, **kwargs)
+    except OSError:
+        return None
+
+
+def ensure_running(port: int, log_path: Path) -> tuple[str, str]:
+    """Idempotently start the dashboard. Returns (status, message).
+
+    status is one of:
+      already-running, started, port-taken, failed.
+    """
+    pid_file = _pid_file_for(log_path)
+    url = f"http://127.0.0.1:{port}"
+
+    existing = _read_pid(pid_file)
+    if existing and _pid_alive(existing) and _port_listening(port):
+        return "already-running", f"dashboard already running (pid {existing}) at {url}"
+
+    if _port_listening(port):
+        # Something else owns the port. Don't fight it.
+        return "port-taken", f"port {port} is in use by another process; dashboard not started"
+
+    # Clean up stale PID file.
+    if pid_file.exists():
+        try:
+            pid_file.unlink()
+        except OSError:
+            pass
+
+    here = Path(__file__).resolve()
+    cmd = [
+        sys.executable, str(here),
+        "--port", str(port),
+        "--log", str(log_path),
+    ]
+    proc = _spawn_detached(cmd)
+    if proc is None:
+        return "failed", "could not spawn dashboard subprocess"
+
+    # Wait up to 3s for the child to bind.
+    for _ in range(30):
+        if _port_listening(port):
+            try:
+                pid_file.write_text(str(proc.pid), encoding="utf-8")
+            except OSError:
+                pass
+            return "started", f"dashboard started (pid {proc.pid}) at {url}"
+        if proc.poll() is not None:
+            return "failed", f"dashboard exited immediately (code {proc.returncode})"
+        time.sleep(0.1)
+    return "failed", "dashboard did not bind within 3 seconds"
+
+
+# ============================================================================
 # Entry point
 # ============================================================================
 
@@ -1381,6 +1535,13 @@ def main() -> int:
                     help="path to audit.jsonl (default: next to this script)")
     ap.add_argument("--no-browser", action="store_true",
                     help="do not auto-open the browser")
+    ap.add_argument("--ensure-running", action="store_true",
+                    help=(
+                        "idempotent background launcher: if no dashboard is "
+                        "running on this port, spawn one as a detached process "
+                        "and exit immediately. Wired in from Claude Code's "
+                        "SessionStart hook so the dashboard is always available."
+                    ))
     args = ap.parse_args()
 
     here = Path(__file__).resolve().parent
@@ -1388,6 +1549,14 @@ def main() -> int:
         Path(args.log).expanduser().resolve()
         if args.log else here / "audit.jsonl"
     )
+
+    if args.ensure_running:
+        status, msg = ensure_running(args.port, log_path)
+        # Print one line so it's discoverable when invoked manually. Claude
+        # Code's SessionStart hook does not show stdout to the user, so this
+        # is harmless inside the hook and useful when run from the terminal.
+        print(msg)
+        return 0
 
     if not log_path.exists():
         print(
@@ -1419,6 +1588,14 @@ def main() -> int:
         print("\nstopping…")
     finally:
         server.server_close()
+        # Best-effort PID file cleanup so the next ensure-running starts fresh.
+        try:
+            pf = _pid_file_for(log_path)
+            existing = _read_pid(pf)
+            if existing == os.getpid():
+                pf.unlink()
+        except OSError:
+            pass
     return 0
 
 
