@@ -1510,6 +1510,77 @@ def _spawn_detached(args: list[str]) -> subprocess.Popen | None:
         return None
 
 
+def stop_running(log_path: Path) -> tuple[str, str]:
+    """Idempotently stop a running dashboard. Returns (status, message).
+
+    status is one of:
+      not-running, stopped, kill-failed.
+    """
+    pid_file = _pid_file_for(log_path)
+    pid = _read_pid(pid_file)
+    if pid is None or not _pid_alive(pid):
+        if pid_file.exists():
+            try:
+                pid_file.unlink()
+            except OSError:
+                pass
+        return "not-running", "dashboard not running"
+
+    # Graceful first: SIGTERM / taskkill.
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(pid)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+    else:
+        try:
+            import signal
+            os.kill(pid, signal.SIGTERM)
+        except (OSError, ProcessLookupError):
+            pass
+
+    # Wait up to 3s for it to exit.
+    for _ in range(30):
+        if not _pid_alive(pid):
+            break
+        time.sleep(0.1)
+
+    # Escalate if still alive.
+    if _pid_alive(pid):
+        if os.name == "nt":
+            try:
+                subprocess.run(
+                    ["taskkill", "/F", "/PID", str(pid)],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=5,
+                )
+            except (OSError, subprocess.SubprocessError):
+                pass
+        else:
+            try:
+                import signal
+                os.kill(pid, signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                pass
+        for _ in range(20):
+            if not _pid_alive(pid):
+                break
+            time.sleep(0.1)
+
+    if _pid_alive(pid):
+        return "kill-failed", f"could not stop dashboard (pid {pid})"
+
+    try:
+        pid_file.unlink()
+    except OSError:
+        pass
+    return "stopped", f"stopped dashboard (pid {pid})"
+
+
 def ensure_running(port: int, log_path: Path) -> tuple[str, str]:
     """Idempotently start the dashboard. Returns (status, message).
 
@@ -1577,6 +1648,12 @@ def main() -> int:
                         "and exit immediately. Wired in from Claude Code's "
                         "SessionStart hook so the dashboard is always available."
                     ))
+    ap.add_argument("--stop", action="store_true",
+                    help=(
+                        "stop a running dashboard. Sends a graceful terminate "
+                        "first, escalates to a forced kill if still alive. "
+                        "Idempotent — second call says 'dashboard not running'."
+                    ))
     args = ap.parse_args()
 
     here = Path(__file__).resolve().parent
@@ -1584,6 +1661,11 @@ def main() -> int:
         Path(args.log).expanduser().resolve()
         if args.log else here / "audit.jsonl"
     )
+
+    if args.stop:
+        status, msg = stop_running(log_path)
+        print(msg)
+        return 0
 
     if args.ensure_running:
         status, msg = ensure_running(args.port, log_path)
