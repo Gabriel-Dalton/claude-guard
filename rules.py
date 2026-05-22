@@ -718,6 +718,26 @@ FAIL_MODE = "closed"
 
 
 # ============================================================================
+# 9.1 DASHBOARD BRIDGE (V4)
+# ============================================================================
+# When True, ask-band decisions wait for a dashboard response before falling
+# through to Claude Code's native prompt. Default off so installs without the
+# dashboard running don't add latency, and so behavior is unchanged for users
+# who haven't opted in.
+#
+# When enabled AND the dashboard is running, the hook writes a pending-decision
+# file, then polls for the user's Approve / Deny click in the dashboard. On
+# response, the verdict becomes the hook's decision. On timeout (60s), the
+# hook falls through to Claude Code's native prompt.
+#
+# When enabled but the dashboard is NOT running, behavior is identical to
+# disabled — the hook does not hang.
+
+DASHBOARD_BRIDGE_ENABLED = False
+DASHBOARD_BRIDGE_TIMEOUT_S = 60
+
+
+# ============================================================================
 # 10. AUTO THREAT FEED MERGE (V2.1)
 # ============================================================================
 # Union compromised_packages_auto.py (written by update_threat_feed.py) into

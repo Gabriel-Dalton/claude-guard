@@ -68,6 +68,8 @@ try:
         MCP_READONLY_COMPILED,
         MCP_HIGH_RISK_COMPILED,
         TRUSTED_MCP_SERVERS,
+        DASHBOARD_BRIDGE_ENABLED,
+        DASHBOARD_BRIDGE_TIMEOUT_S,
     )
 except Exception as _e:  # ImportError, SyntaxError, NameError, etc.
     _RULES_LOAD_ERROR = (
@@ -83,6 +85,8 @@ except Exception as _e:  # ImportError, SyntaxError, NameError, etc.
     MCP_READONLY_COMPILED = []
     MCP_HIGH_RISK_COMPILED = []
     TRUSTED_MCP_SERVERS = set()
+    DASHBOARD_BRIDGE_ENABLED = False
+    DASHBOARD_BRIDGE_TIMEOUT_S = 60
     FAIL_MODE = _FAIL_MODE_DEFAULT
 
 
@@ -685,6 +689,175 @@ def log_decision(decision: str, score: int, signals: list, ctx: Context,
 
 
 # ============================================================================
+# Dashboard bridge (V4)
+# ============================================================================
+# When DASHBOARD_BRIDGE_ENABLED is True and the dashboard is running, ask-band
+# decisions are routed through the dashboard for one-click approve / deny.
+#
+# File protocol (intentionally simple: any process that can read/write
+# ~/.claude/guard/pending/ is the user, so this is single-user by design):
+#
+#   pending/<uuid>.json       request — written by hook, read by dashboard
+#   pending/<uuid>.response   verdict — written by dashboard, read by hook
+#
+# Hook polls the response file. On 60s timeout, falls through to Claude
+# Code's native prompt.
+
+_PENDING_POLL_INTERVAL_S = 0.25
+
+
+def _guard_dir() -> Path:
+    return Path(__file__).resolve().parent
+
+
+def _pending_dir() -> Path:
+    return _guard_dir() / "pending"
+
+
+def _dashboard_pid_alive() -> bool:
+    """True if dashboard.pid points to a live process. We import the helpers
+    from dashboard.py lazily so the hook stays standalone if dashboard.py is
+    missing (older installs)."""
+    pid_file = _guard_dir() / "dashboard.pid"
+    if not pid_file.exists():
+        return False
+    try:
+        import dashboard as _dash
+    except Exception:
+        return False
+    pid = _dash._read_pid(pid_file)
+    if pid is None:
+        return False
+    return _dash._pid_alive(pid)
+
+
+def _write_pending_record(record: dict) -> Optional[Path]:
+    """Write the request file. Returns its path on success, None on failure."""
+    pdir = _pending_dir()
+    try:
+        pdir.mkdir(parents=True, exist_ok=True)
+        if os.name != "nt":
+            try:
+                os.chmod(pdir, 0o700)
+            except OSError:
+                pass
+    except OSError:
+        return None
+
+    req_path = pdir / f"{record['uuid']}.json"
+    tmp_path = pdir / f"{record['uuid']}.json.tmp"
+    try:
+        with tmp_path.open("w", encoding="utf-8") as f:
+            json.dump(record, f)
+        os.replace(tmp_path, req_path)
+    except OSError:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        return None
+    return req_path
+
+
+def _wait_for_bridge_response(uuid: str, timeout_s: float) -> Optional[str]:
+    """Poll for pending/<uuid>.response. Returns 'allow' / 'deny' / None."""
+    resp_path = _pending_dir() / f"{uuid}.response"
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if resp_path.exists():
+            try:
+                data = json.loads(resp_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                data = None
+            try:
+                resp_path.unlink()
+            except OSError:
+                pass
+            if isinstance(data, dict):
+                v = data.get("verdict")
+                if v in ("allow", "deny"):
+                    return v
+            return None
+        time.sleep(_PENDING_POLL_INTERVAL_S)
+    return None
+
+
+def _cleanup_pending(uuid: str) -> None:
+    for name in (f"{uuid}.json", f"{uuid}.response"):
+        try:
+            (_pending_dir() / name).unlink()
+        except OSError:
+            pass
+
+
+def maybe_resolve_via_bridge(
+    decision: str, score: int, signals: list, ctx: Context,
+) -> tuple[str, list]:
+    """If conditions are right, route this ask-band decision through the
+    dashboard. Returns (possibly-mutated decision, possibly-augmented signals).
+
+    Conditions: DASHBOARD_BRIDGE_ENABLED is True, decision is 'ask', dashboard
+    is alive. Anything else: return inputs unchanged.
+    """
+    if decision != "ask":
+        return decision, signals
+    if not DASHBOARD_BRIDGE_ENABLED:
+        return decision, signals
+    if not _dashboard_pid_alive():
+        return decision, signals
+
+    import uuid as _uuid
+    req_uuid = _uuid.uuid4().hex
+    record = {
+        "uuid": req_uuid,
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "tool": ctx.tool_name,
+        "command": ctx.command,
+        "project_dir": str(ctx.project_dir),
+        "score": score,
+        "decision": decision,
+        "is_powershell": ctx.is_powershell,
+        "signals": [asdict(s) for s in signals],
+    }
+
+    if _write_pending_record(record) is None:
+        return decision, signals
+
+    try:
+        verdict = _wait_for_bridge_response(req_uuid, DASHBOARD_BRIDGE_TIMEOUT_S)
+    finally:
+        _cleanup_pending(req_uuid)
+
+    if verdict == "allow":
+        signals = signals + [Signal(
+            "dashboard_bridge_allow", 0,
+            "User clicked Approve in the dashboard",
+        )]
+        return "allow", signals
+    if verdict == "deny":
+        signals = signals + [Signal(
+            "dashboard_bridge_deny", 0,
+            "User clicked Deny in the dashboard",
+        )]
+        return "deny", signals
+
+    # Timeout — fall through to Claude Code's native prompt.
+    try:
+        print(
+            f"claude-guard: dashboard bridge timed out after "
+            f"{DASHBOARD_BRIDGE_TIMEOUT_S}s; falling through to native prompt",
+            file=sys.stderr,
+        )
+    except OSError:
+        pass
+    signals = signals + [Signal(
+        "dashboard_bridge_timeout", 0,
+        f"No dashboard response within {DASHBOARD_BRIDGE_TIMEOUT_S}s",
+    )]
+    return "ask", signals
+
+
+# ============================================================================
 # Fail-mode handling
 # ============================================================================
 
@@ -801,9 +974,17 @@ def _main_inner():
     else:
         decision = map_score_to_decision(score)
 
+    # Dashboard bridge: route ask-band through the dashboard for one-click
+    # approve/deny. No-op for non-ask decisions or when not enabled / not
+    # running. Bridge wait is folded into the bridge_ms timing slot.
+    t_bridge_start = time.perf_counter()
+    decision, signals = maybe_resolve_via_bridge(decision, score, signals, ctx)
+    t_bridge_end = time.perf_counter()
+
     timing = {
         "parse_ms":    round((t1 - t0) * 1000, 3),
         "evaluate_ms": round((t2 - t1) * 1000, 3),
+        "bridge_ms":   round((t_bridge_end - t_bridge_start) * 1000, 3),
     }
 
     emit(decision, score, signals, ctx, timing)

@@ -192,7 +192,10 @@ def load_settings(path: Path) -> tuple[dict, bool]:
 
 
 GUARD_MATCHER = "Bash|Edit|Write|MultiEdit|WebFetch|WebSearch|mcp__.*"
-GUARD_TIMEOUT = 10
+# 90s leaves room for the optional 60s dashboard bridge wait + headroom for
+# cold-start Python launch on first-call-after-resume. Hook normally returns
+# in <5ms; this is only the kill ceiling.
+GUARD_TIMEOUT = 90
 
 
 def merge_hook(settings: dict, hook_command: str) -> bool:
