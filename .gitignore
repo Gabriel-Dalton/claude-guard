@@ -36,3 +36,13 @@ __pycache__/
 .DS_Store
 Thumbs.db
 .playwright-mcp/
+
+# ─── one-off recovery scripts and staging dirs ──────────────────────────
+# Generated during the 2026-05-21 audit.jsonl recovery (see issue #1).
+# Kept for reference; should not be committed.
+shadow-recovery/
+shadow-recovery-elevated.ps1
+merge-recovered.py
+vss-shadows.txt
+audit.pre-merge.jsonl
+audit.merged.jsonl
