@@ -1002,6 +1002,54 @@ h1 {
 .row.ask .score   { color: var(--warn); }
 .row.deny .score  { color: var(--bad); }
 .row[aria-expanded="true"] { background: var(--bg-elev-2); }
+.row.flash-in {
+  animation: flash-in 1.6s ease-out;
+}
+@keyframes flash-in {
+  0%   { background: var(--accent-tint); }
+  100% { background: transparent; }
+}
+.row.ask.flash-in   { animation-name: flash-in-ask; }
+.row.deny.flash-in  { animation-name: flash-in-deny; }
+@keyframes flash-in-ask {
+  0%   { background: var(--warn-tint); }
+  100% { background: transparent; }
+}
+@keyframes flash-in-deny {
+  0%   { background: var(--bad-tint); }
+  100% { background: transparent; }
+}
+
+/* ─── status bar toggle ─────────────────────────────────────── */
+.notify-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 0.2rem 0.55rem;
+  margin-right: 0.5rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg-elev);
+  color: var(--fg-soft);
+  transition: color 0.12s ease, border-color 0.12s ease;
+}
+.notify-toggle:hover { color: var(--fg); border-color: var(--accent-soft); }
+.notify-toggle[aria-pressed="true"] {
+  color: var(--accent);
+  border-color: var(--accent-soft);
+  background: var(--accent-tint);
+}
+.notify-toggle::before {
+  content: "";
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: var(--fg-faint);
+}
+.notify-toggle[aria-pressed="true"]::before { background: var(--accent); }
 
 .row-detail {
   display: none;
@@ -1136,6 +1184,10 @@ h1 {
   </span>
   <span class="path" id="log-path" aria-label="audit log location">~/.claude/guard/audit.jsonl</span>
   <span class="spacer"></span>
+  <button class="notify-toggle" id="notify-toggle" type="button"
+          aria-pressed="false" title="Browser notifications for ask / deny decisions">
+    notify
+  </button>
   <span class="live idle" id="live" aria-live="polite">
     <span class="live-pip" aria-hidden="true"></span>
     <span id="live-label">connecting…</span>
@@ -1262,10 +1314,16 @@ h1 {
 </main>
 
 <script>
-const POLL_MS = 2000;
+const POLL_MS = 1000;
 const PENDING_POLL_MS = 1000;
 const FEED_LIMIT = 200;
 const $ = (id) => document.getElementById(id);
+
+// Persisted prefs (survives reloads). Default ON for ask/deny notifications
+// — those are infrequent enough that pinging the user is useful, not noisy.
+const PREFS = {
+  notify: localStorage.getItem("cg.notify") !== "off",
+};
 
 const state = {
   window:  "24h",
@@ -1279,6 +1337,8 @@ const state = {
   pending: [],
   seenPendingIds: new Set(),
   acting: new Set(),      // pending uuids whose buttons are mid-action
+  seenDecisionKeys: new Set(),  // rowKey strings we've already shown
+  bootDone: false,        // first poll seeds seen-set without notifying
 };
 
 const fmt = {
@@ -1416,14 +1476,17 @@ function renderFeed() {
     return;
   }
   $("empty").hidden = true;
+  // Mark rows whose key is not in seenDecisionKeys yet — they'll flash in.
+  // Seed runs on the first poll so we don't flash every row at boot.
   let html = "";
   for (const e of entries) {
     const dec = (e.decision || "ask").toLowerCase();
     const score = (typeof e.score === "number") ? e.score : 0;
     const key = rowKey(e);
     const open = state.open.has(key);
+    const isNew = state.bootDone && !state.seenDecisionKeys.has(key);
     html += `
-      <div class="row ${dec}" tabindex="0" role="button"
+      <div class="row ${dec}${isNew ? " flash-in" : ""}" tabindex="0" role="button"
            aria-expanded="${open ? "true" : "false"}"
            data-key="${fmt.esc(key)}">
         <span class="ts">${fmt.esc(fmt.ts(e.ts))}</span>
@@ -1539,12 +1602,52 @@ async function poll() {
     state.entries = decs.entries || [];
     state.lastOk = Date.now();
     setLive("live", "live");
+
+    // Surface notifications for new ask / deny entries. The first poll
+    // seeds seenDecisionKeys silently so we don't fire on backlog at load.
+    notifyOnNewDecisions(state.entries);
+
     render();
   } catch (e) {
     setLive("stale", "reconnecting…");
   } finally {
     state.pollPending = false;
   }
+}
+
+function notifyOnNewDecisions(entries) {
+  const newAskDeny = [];
+  for (const e of entries) {
+    const key = rowKey(e);
+    if (state.seenDecisionKeys.has(key)) continue;
+    state.seenDecisionKeys.add(key);
+    const dec = (e.decision || "").toLowerCase();
+    if (state.bootDone && (dec === "ask" || dec === "deny")) {
+      newAskDeny.push(e);
+    }
+  }
+  state.bootDone = true;
+
+  if (!PREFS.notify) return;
+  if (!("Notification" in window)) return;
+  if (Notification.permission !== "granted") return;
+  // Cap to 3 notifications per poll so a burst doesn't spam the OS tray.
+  for (const e of newAskDeny.slice(0, 3)) {
+    fireDecisionNotification(e);
+  }
+}
+
+function fireDecisionNotification(e) {
+  const dec = (e.decision || "").toUpperCase();
+  const tool = e.tool || "?";
+  const cmd = (e.command || "").slice(0, 140);
+  try {
+    const n = new Notification(`claude-guard: ${dec}`, {
+      body: `${tool} · score ${e.score ?? "?"}\n${cmd}`,
+      tag: `cg-decision-${e.ts}-${tool}`,
+    });
+    n.onclick = () => { window.focus(); n.close(); };
+  } catch (err) { /* noop */ }
 }
 
 function setLive(cls, label) {
@@ -1663,6 +1766,43 @@ function maybeRequestNotificationPermission() {
   }
 }
 
+function refreshNotifyToggle() {
+  const btn = $("notify-toggle");
+  if (!btn) return;
+  const granted = ("Notification" in window) && Notification.permission === "granted";
+  const on = PREFS.notify && granted;
+  btn.setAttribute("aria-pressed", on ? "true" : "false");
+  if (!("Notification" in window)) {
+    btn.textContent = "no notif";
+    btn.title = "Browser does not support the Notification API";
+    btn.disabled = true;
+    return;
+  }
+  if (!PREFS.notify) {
+    btn.textContent = "notify: off";
+    btn.title = "Click to enable browser notifications for ask / deny";
+  } else if (!granted) {
+    btn.textContent = "notify: blocked";
+    btn.title = "Browser hasn't granted permission. Click to request again.";
+  } else {
+    btn.textContent = "notify: on";
+    btn.title = "Browser notifications enabled for ask / deny. Click to mute.";
+  }
+}
+
+async function toggleNotify() {
+  if (!("Notification" in window)) return;
+  // Toggle the user preference.
+  PREFS.notify = !PREFS.notify;
+  localStorage.setItem("cg.notify", PREFS.notify ? "on" : "off");
+  // If turning on and permission not granted yet, request it now (user
+  // gesture, so browsers will actually show the prompt).
+  if (PREFS.notify && Notification.permission !== "granted") {
+    try { await Notification.requestPermission(); } catch (e) { /* noop */ }
+  }
+  refreshNotifyToggle();
+}
+
 // ─── input wiring ──────────────────────────────────────────────────────
 document.querySelectorAll(".window-bar button").forEach(b => {
   b.addEventListener("click", () => {
@@ -1699,18 +1839,31 @@ document.addEventListener("keydown", (e) => {
 poll();
 setInterval(poll, POLL_MS);
 
-// Pending bridge: faster polling, separate stream so it stays responsive even
-// when the main stats poll is in flight or stalled.
+// Pending bridge: 1s poll, separate stream so it stays responsive even when
+// the main stats poll is in flight or stalled.
 maybeRequestNotificationPermission();
+refreshNotifyToggle();
 pollPending();
 setInterval(pollPending, PENDING_POLL_MS);
+
+// Notify-toggle wiring
+$("notify-toggle").addEventListener("click", toggleNotify);
 
 // Request notification permission on the first user interaction too — many
 // browsers gate it on a user gesture and silently ignore the boot-time call.
 document.addEventListener("click", function once() {
   maybeRequestNotificationPermission();
+  refreshNotifyToggle();
   document.removeEventListener("click", once);
 }, {once: true});
+
+// Re-render the toggle if the permission state changes (some browsers
+// expose this via the Permissions API).
+if ("permissions" in navigator) {
+  navigator.permissions.query({name: "notifications"})
+    .then(p => { p.onchange = refreshNotifyToggle; })
+    .catch(() => {});
+}
 </script>
 </body>
 </html>
