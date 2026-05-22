@@ -86,16 +86,22 @@ Open a new Claude Code session. The `PreToolUse` hook fires automatically on eve
 
 ## Verify
 
-Run the self-test from anywhere:
+Run the self-test from anywhere.
 
+**macOS / Linux**
 ```bash
-python ~/.claude/guard/claude-guard.py --test
+python3 "$HOME/.claude/guard/claude-guard.py" --test
+```
+
+**Windows (PowerShell)**
+```powershell
+python "$env:USERPROFILE\.claude\guard\claude-guard.py" --test
 ```
 
 You should see a fixture of commands and their scores. Then **open a new Claude Code session** (existing sessions don't reload `settings.json`). The next Bash / Edit / Write / MCP tool call routes through the hook. Watch decisions land in real time:
 
 - **Live dashboard:** http://127.0.0.1:7475 (auto-launches on every session via the `SessionStart` hook)
-- **Raw log:** `~/.claude/guard/audit.jsonl`
+- **Raw log:** `audit.jsonl` next to the installer (`$HOME/.claude/guard/audit.jsonl` on POSIX, `$env:USERPROFILE\.claude\guard\audit.jsonl` on Windows)
 
 ## How it runs after install
 
@@ -107,33 +113,38 @@ There's no daemon to start. The hook is invoked by Claude Code itself:
 
 ## Updating
 
-Source-code changes don't reach the live hook until you re-run the installer (the install dir is a separate copy of the files). The flow:
+Re-run the same one-liner you used to install. The bootstrap stops the running dashboard, fast-forwards the git clone, and re-runs the installer.
 
+**macOS / Linux**
 ```bash
-# 1. Stop the dashboard so it isn't holding files open
-python ~/.claude/guard/dashboard.py --stop
-
-# 2a. If your install dir is itself a git clone (the default):
-git -C ~/.claude/guard pull && python ~/.claude/guard/install.py --global --yes
-
-# 2b. Or if you keep a separate source clone:
-git -C /path/to/your/claude-guard pull && python /path/to/your/claude-guard/install.py --global --yes
+curl -fsSL https://raw.githubusercontent.com/Gabriel-Dalton/claude-guard/main/bootstrap.sh | bash
 ```
 
-Open a new Claude Code session. The dashboard relaunches automatically.
+**Windows (PowerShell)**
+```powershell
+iwr https://raw.githubusercontent.com/Gabriel-Dalton/claude-guard/main/bootstrap.ps1 -UseBasicParsing | iex
+```
+
+Open a new Claude Code session. The dashboard relaunches automatically. The installer also auto-stops a running dashboard if you invoke `install.py` directly, so the only commands you need are the ones above.
+
+If you keep your source clone separately from the install dir, point the installer at the clone:
+
+```
+python /path/to/your/claude-guard/install.py --global --yes
+```
 
 ## Troubleshooting
 
 <details>
 <summary><code>PermissionError: [WinError 32] The process cannot access the file because it is being used by another process</code> during install</summary>
 
-The dashboard process is holding files open in the install dir. Stop it, then re-run the installer:
+The dashboard process is holding files open in the install dir. The installer now stops it automatically, so this error should be rare. If it still surfaces — usually because you're upgrading from a pre-v4 install that didn't ship `--stop` — kill it by hand and re-run:
 
 ```powershell
 python "$env:USERPROFILE\.claude\guard\dashboard.py" --stop
 ```
 
-It relaunches on the next Claude Code session.
+If that also fails (no `--stop` flag in the installed dashboard), end the `python.exe` task that's listening on port 7475 via Task Manager. It relaunches on the next Claude Code session.
 </details>
 
 <details>
@@ -145,11 +156,7 @@ You already have claude-guard installed at that path. Skip the `git clone` step 
 <details>
 <summary><code>python: can't open file 'claude-guard.py': No such file or directory</code></summary>
 
-You don't run `claude-guard.py` from inside your project — it's a hook that fires automatically. To test it, use the absolute path:
-
-```bash
-python ~/.claude/guard/claude-guard.py --test
-```
+You don't run `claude-guard.py` from inside your project — it's a hook that fires automatically. To test it, use the absolute path (see the [Verify](#verify) section above).
 </details>
 
 <details>
@@ -161,24 +168,37 @@ Existing Claude Code sessions don't reload `settings.json`. Close the session an
 <details>
 <summary>Dashboard isn't loading at 127.0.0.1:7475</summary>
 
-Check that it's running:
+Start it manually.
 
+**macOS / Linux**
 ```bash
-cat  ~/.claude/guard/dashboard.pid       # macOS / Linux
-type %USERPROFILE%\.claude\guard\dashboard.pid    # Windows (cmd)
+python3 "$HOME/.claude/guard/dashboard.py" --ensure-running
 ```
 
-If empty or the process is dead, start it manually:
-
-```bash
-python ~/.claude/guard/dashboard.py --ensure-running
+**Windows (PowerShell)**
+```powershell
+python "$env:USERPROFILE\.claude\guard\dashboard.py" --ensure-running
 ```
+
+`--ensure-running` is idempotent: it exits silently if a dashboard is already up, spawns a fresh detached one otherwise. It's the same command the `SessionStart` hook fires every time Claude Code opens.
 </details>
 
 <details>
 <summary>Getting too many "ask" prompts</summary>
 
-After a week of real use, run `python ~/.claude/guard/tune.py review`. It clusters your noisy ask-band commands and offers to write allowlist patterns to `rules_user.py` (your base `rules.py` stays untouched, so future updates remain clean).
+After a week of real use, run the tuner.
+
+**macOS / Linux**
+```bash
+python3 "$HOME/.claude/guard/tune.py" review
+```
+
+**Windows (PowerShell)**
+```powershell
+python "$env:USERPROFILE\.claude\guard\tune.py" review
+```
+
+It clusters your noisy ask-band commands and offers to write allowlist patterns to `rules_user.py` (your base `rules.py` stays untouched, so future updates remain clean).
 </details>
 
 <details>

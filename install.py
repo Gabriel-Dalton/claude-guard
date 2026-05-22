@@ -142,6 +142,29 @@ def _same_dir(a: Path, b: Path) -> bool:
         return str(a).rstrip("\\/").lower() == str(b).rstrip("\\/").lower()
 
 
+def stop_running_dashboard(install_dir: Path) -> None:
+    """If a dashboard is running from the install dir, stop it. Otherwise
+    Windows holds dashboard.py / dashboard.pyc open and shutil.copy2 fails
+    with WinError 32. No-op if dashboard.py isn't there (fresh install)."""
+    dash_py = install_dir / "dashboard.py"
+    if not dash_py.exists():
+        return
+    try:
+        result = subprocess.run(
+            [sys.executable, str(dash_py), "--stop"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=10,
+        )
+        msg = (result.stdout or b"").decode("utf-8", errors="replace").strip()
+        if msg and msg != "dashboard not running":
+            info(msg)
+    except (OSError, subprocess.SubprocessError):
+        # Older installs may not support --stop; the install will fail
+        # with WinError 32 if a dashboard is genuinely live, but it'll
+        # at least surface a clear error rather than corrupt files.
+        pass
+
+
 def copy_files(src: Path, dst: Path) -> int:
     dst.mkdir(parents=True, exist_ok=True)
     in_place = _same_dir(src, dst)
@@ -449,6 +472,10 @@ def main() -> int:
         )):
             fail("aborted by user.")
             return 1
+
+    # Stop a running dashboard so it isn't holding files open in the install
+    # dir during the copy (Windows WinError 32). Safe no-op on fresh installs.
+    stop_running_dashboard(install_dir)
 
     copied = copy_files(src, install_dir)
     ok(f"copied {copied} file(s) to {install_dir}")
