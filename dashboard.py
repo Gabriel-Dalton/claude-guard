@@ -38,6 +38,8 @@ DEFAULT_PORT = 7475
 HISTOGRAM_BUCKETS = 10
 TOP_N = 10
 DECISION_LIMIT = 200
+PENDING_MAX_AGE_S = 300  # ignore stale pending files older than 5 minutes
+PENDING_UUID_RE = re.compile(r"^[a-f0-9]{8,64}$")
 
 # Window selector values map to a duration in seconds. "all" means no cutoff.
 WINDOWS = {
@@ -326,6 +328,76 @@ def compute_stats(all_entries: list[dict], window: str) -> dict:
 
 
 # ============================================================================
+# Pending decisions (V4 dashboard bridge)
+# ============================================================================
+# The hook writes pending/<uuid>.json when an ask-band decision needs human
+# approval. The dashboard reads those files, surfaces them in the UI, and
+# writes pending/<uuid>.response when the user clicks Approve / Deny.
+
+def _pending_dir_for(log_path: Path) -> Path:
+    return log_path.parent / "pending"
+
+
+def list_pending(log_path: Path) -> list[dict]:
+    """Return all pending request records. Cleans up stale request files
+    (older than PENDING_MAX_AGE_S) so a dead hook doesn't leave them forever."""
+    pdir = _pending_dir_for(log_path)
+    if not pdir.exists():
+        return []
+    now = time.time()
+    out = []
+    try:
+        files = sorted(pdir.glob("*.json"))
+    except OSError:
+        return []
+    for f in files:
+        try:
+            age = now - f.stat().st_mtime
+        except OSError:
+            continue
+        if age > PENDING_MAX_AGE_S:
+            try:
+                f.unlink()
+                (f.with_suffix(".response")).unlink()
+            except OSError:
+                pass
+            continue
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(data, dict) and data.get("uuid"):
+            data["_age_s"] = round(age, 1)
+            out.append(data)
+    return out
+
+
+def write_pending_response(log_path: Path, uuid: str, verdict: str) -> bool:
+    """Atomically write pending/<uuid>.response. Returns True on success."""
+    if verdict not in ("allow", "deny"):
+        return False
+    if not PENDING_UUID_RE.match(uuid):
+        return False
+    pdir = _pending_dir_for(log_path)
+    req = pdir / f"{uuid}.json"
+    if not req.exists():
+        return False
+    resp = pdir / f"{uuid}.response"
+    tmp = pdir / f"{uuid}.response.tmp"
+    try:
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump({"verdict": verdict}, f)
+        os.replace(tmp, resp)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        return False
+    return True
+
+
+# ============================================================================
 # HTTP handler
 # ============================================================================
 
@@ -343,6 +415,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._serve_stats(parse_qs(parsed.query))
         elif parsed.path == "/api/decisions":
             self._serve_decisions(parse_qs(parsed.query))
+        elif parsed.path == "/api/pending":
+            self._serve_pending()
         elif parsed.path == "/api/health":
             self._serve_json({"ok": True, "log_path": str(self.log_path)})
         elif parsed.path == "/favicon.ico":
@@ -350,6 +424,34 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.end_headers()
         else:
             self.send_error(HTTPStatus.NOT_FOUND)
+
+    def do_POST(self) -> None:  # noqa: N802
+        parsed = urlsplit(self.path)
+        # /api/pending/<uuid>/respond
+        m = re.match(r"^/api/pending/([a-f0-9]{8,64})/respond$", parsed.path)
+        if not m:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        uuid = m.group(1)
+        length = int(self.headers.get("Content-Length") or 0)
+        if length <= 0 or length > 4096:
+            self.send_error(HTTPStatus.BAD_REQUEST, "missing or oversized body")
+            return
+        try:
+            raw = self.rfile.read(length)
+            data = json.loads(raw.decode("utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            self.send_error(HTTPStatus.BAD_REQUEST, "invalid JSON")
+            return
+        verdict = (data or {}).get("verdict")
+        if verdict not in ("allow", "deny"):
+            self.send_error(HTTPStatus.BAD_REQUEST, "verdict must be allow or deny")
+            return
+        ok = write_pending_response(self.log_path, uuid, verdict)
+        if not ok:
+            self.send_error(HTTPStatus.NOT_FOUND, "no such pending decision")
+            return
+        self._serve_json({"ok": True, "uuid": uuid, "verdict": verdict})
 
     def _serve_html(self) -> None:
         body = INDEX_HTML.encode("utf-8")
@@ -408,6 +510,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             "filter": decision_filter,
             "q": query,
         })
+
+    def _serve_pending(self) -> None:
+        items = list_pending(self.log_path)
+        self._serve_json({"pending": items, "count": len(items)})
 
     def _serve_json(self, payload: dict) -> None:
         body = json.dumps(payload, default=str).encode("utf-8")
@@ -530,6 +636,82 @@ button:focus-visible, input:focus-visible, [tabindex]:focus-visible {
   0%, 100% { opacity: 1; transform: scale(1); }
   50%      { opacity: 0.55; transform: scale(0.85); }
 }
+
+/* ─── pending-decision bridge banner ───────────────────────── */
+.pending-banner {
+  position: sticky;
+  top: 32px;
+  z-index: 49;
+  padding: 0.8rem 1rem;
+  background: linear-gradient(180deg, rgba(226, 176, 107, 0.18), rgba(226, 176, 107, 0.06));
+  border-bottom: 1px solid var(--accent-soft);
+  display: none;
+}
+.pending-banner.has-items { display: block; }
+.pending-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.8rem;
+  align-items: center;
+  padding: 0.55rem 0.75rem;
+  margin-bottom: 0.5rem;
+  border: 1px solid var(--accent-soft);
+  background: var(--bg-elev);
+  border-radius: 6px;
+}
+.pending-card:last-child { margin-bottom: 0; }
+.pending-card__body {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.18rem;
+}
+.pending-card__head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-family: var(--font-mono);
+  font-size: 0.66rem;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--accent);
+}
+.pending-card__age { color: var(--fg-soft); }
+.pending-card__cmd {
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+  color: var(--fg);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pending-card__sigs {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  color: var(--fg-soft);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pending-card__actions { display: flex; gap: 0.4rem; }
+.pending-btn {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  padding: 0.45rem 0.9rem;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--bg-elev-2);
+  color: var(--fg);
+  transition: all 0.12s ease;
+}
+.pending-btn:hover:not(:disabled) { transform: translateY(-1px); }
+.pending-btn:disabled { opacity: 0.5; cursor: wait; }
+.pending-btn.allow { color: var(--good); border-color: var(--good); }
+.pending-btn.allow:hover:not(:disabled) { background: var(--good-tint); }
+.pending-btn.deny  { color: var(--bad);  border-color: var(--bad); }
+.pending-btn.deny:hover:not(:disabled)  { background: var(--bad-tint); }
 
 /* ─── layout ───────────────────────────────────────────────── */
 .app {
@@ -958,8 +1140,10 @@ h1 {
     <span class="live-pip" aria-hidden="true"></span>
     <span id="live-label">connecting…</span>
   </span>
-  <span class="ver" aria-label="version">v3</span>
+  <span class="ver" aria-label="version">v4</span>
 </header>
+
+<aside class="pending-banner" id="pending-banner" role="region" aria-label="Pending decisions awaiting approval" aria-live="polite"></aside>
 
 <main class="app" id="app">
   <section aria-labelledby="title">
@@ -1079,6 +1263,7 @@ h1 {
 
 <script>
 const POLL_MS = 2000;
+const PENDING_POLL_MS = 1000;
 const FEED_LIMIT = 200;
 const $ = (id) => document.getElementById(id);
 
@@ -1091,6 +1276,9 @@ const state = {
   open:    new Set(),     // expanded rows, keyed by ts+command
   lastOk:  0,
   pollPending: false,
+  pending: [],
+  seenPendingIds: new Set(),
+  acting: new Set(),      // pending uuids whose buttons are mid-action
 };
 
 const fmt = {
@@ -1366,6 +1554,115 @@ function setLive(cls, label) {
   $("live-label").textContent = label;
 }
 
+// ─── pending bridge ────────────────────────────────────────────────────
+async function pollPending() {
+  try {
+    const r = await fetch("/api/pending", {cache: "no-store"});
+    if (!r.ok) return;
+    const data = await r.json();
+    const items = data.pending || [];
+    // Fire a browser notification for any new pending uuid we haven't seen.
+    for (const item of items) {
+      if (!state.seenPendingIds.has(item.uuid)) {
+        state.seenPendingIds.add(item.uuid);
+        firePendingNotification(item);
+      }
+    }
+    state.pending = items;
+    renderPending();
+  } catch (e) {
+    // Silent: pending polling failures should not disturb the rest of the UI.
+  }
+}
+
+function renderPending() {
+  const el = $("pending-banner");
+  const items = state.pending || [];
+  if (!items.length) {
+    el.classList.remove("has-items");
+    el.innerHTML = "";
+    return;
+  }
+  el.classList.add("has-items");
+  const cards = items.map(item => {
+    const sigs = (item.signals || [])
+      .map(s => `${s.points >= 0 ? "+" : ""}${s.points} ${s.name}`)
+      .join(" · ");
+    const acting = state.acting.has(item.uuid);
+    const ageS = Math.round(item._age_s || 0);
+    return `
+      <div class="pending-card" data-uuid="${fmt.esc(item.uuid)}">
+        <div class="pending-card__body">
+          <div class="pending-card__head">
+            <span>review needed</span>
+            <span class="pending-card__age">${ageS}s ago · score ${item.score ?? "?"} · ${fmt.esc(item.tool || "?")}</span>
+          </div>
+          <div class="pending-card__cmd" title="${fmt.esc(item.command || "")}">${fmt.esc(fmt.shortCmd(item.command || "", 160))}</div>
+          ${sigs ? `<div class="pending-card__sigs">${fmt.esc(sigs)}</div>` : ""}
+        </div>
+        <div class="pending-card__actions">
+          <button class="pending-btn allow" data-verdict="allow" ${acting ? "disabled" : ""}>approve</button>
+          <button class="pending-btn deny"  data-verdict="deny"  ${acting ? "disabled" : ""}>deny</button>
+        </div>
+      </div>`;
+  }).join("");
+  el.innerHTML = cards;
+  el.querySelectorAll(".pending-btn").forEach(btn => {
+    btn.addEventListener("click", () => respondPending(btn));
+  });
+}
+
+async function respondPending(btn) {
+  const card = btn.closest(".pending-card");
+  if (!card) return;
+  const uuid = card.dataset.uuid;
+  const verdict = btn.dataset.verdict;
+  if (!uuid || !verdict || state.acting.has(uuid)) return;
+  state.acting.add(uuid);
+  // Disable buttons immediately for snappy feedback.
+  card.querySelectorAll(".pending-btn").forEach(b => { b.disabled = true; });
+  try {
+    const r = await fetch(`/api/pending/${encodeURIComponent(uuid)}/respond`, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({verdict: verdict}),
+    });
+    if (!r.ok) throw new Error("respond failed");
+    // Optimistically remove from our local list so the banner clears.
+    state.pending = state.pending.filter(p => p.uuid !== uuid);
+    renderPending();
+  } catch (e) {
+    state.acting.delete(uuid);
+    renderPending();
+  }
+}
+
+function firePendingNotification(item) {
+  if (!("Notification" in window)) return;
+  if (Notification.permission !== "granted") return;
+  try {
+    const body = `${item.tool || ""} · score ${item.score ?? "?"}\n${(item.command || "").slice(0, 120)}`;
+    const n = new Notification("claude-guard: review needed", {
+      body: body,
+      tag: `cg-pending-${item.uuid}`,
+      requireInteraction: false,
+    });
+    n.onclick = () => { window.focus(); n.close(); };
+  } catch (e) {
+    // Browser may throw if the page is hidden in some constrained contexts.
+  }
+}
+
+function maybeRequestNotificationPermission() {
+  if (!("Notification" in window)) return;
+  if (Notification.permission === "default") {
+    // Browsers require a user gesture in many cases; we still try once on
+    // load. If it gets denied or stuck on default, notifications just won't
+    // fire and the in-page banner is still the source of truth.
+    try { Notification.requestPermission(); } catch (e) { /* noop */ }
+  }
+}
+
 // ─── input wiring ──────────────────────────────────────────────────────
 document.querySelectorAll(".window-bar button").forEach(b => {
   b.addEventListener("click", () => {
@@ -1401,6 +1698,19 @@ document.addEventListener("keydown", (e) => {
 // Initial poll + interval
 poll();
 setInterval(poll, POLL_MS);
+
+// Pending bridge: faster polling, separate stream so it stays responsive even
+// when the main stats poll is in flight or stalled.
+maybeRequestNotificationPermission();
+pollPending();
+setInterval(pollPending, PENDING_POLL_MS);
+
+// Request notification permission on the first user interaction too — many
+// browsers gate it on a user gesture and silently ignore the boot-time call.
+document.addEventListener("click", function once() {
+  maybeRequestNotificationPermission();
+  document.removeEventListener("click", once);
+}, {once: true});
 </script>
 </body>
 </html>
