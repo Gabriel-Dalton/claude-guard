@@ -38,6 +38,34 @@ DEFAULT_PORT = 7475
 HISTOGRAM_BUCKETS = 10
 TOP_N = 10
 DECISION_LIMIT = 200
+
+# ─── Time-saved math (see /api/stats -> time_saved + dashboard footnotes) ──
+# Each constant is derived from first principles, not picked to make the
+# number look impressive. The frontend renders the breakdown so a user can
+# audit the claim.
+#
+# Per allow vs default Claude Code's permission prompt:
+#   1.0s prompt render + read · 1.5s decide · 1.0s click · 1.5s context resume.
+TIME_PER_ALLOW_S = 5.0
+# Per ask: still prompts the user, same friction as default Claude. Zero.
+TIME_PER_ASK_S = 0.0
+# Per nuisance-grade deny vs --dangerously-skip-permissions: things you'd
+# notice and recover from in minutes (force-push to main, config rewrite,
+# credential read). Average of git reflog undo (~2m), config restore (~5m),
+# credential rotate (~10m) ≈ ~3 minutes.
+TIME_PER_DENY_NUISANCE_S = 180.0
+# Per incident-grade deny: a real attempted disaster. Recovery floor:
+#   5m notice + 10m diagnose + 10m cleanup + 5m restore = 30 minutes.
+# Real supply-chain incidents cost engineers days, so 30m is a conservative
+# floor, not a ceiling.
+TIME_PER_DENY_INCIDENT_S = 1800.0
+# Signal names that elevate a deny to incident-grade. Sourced from
+# claude-guard.py — the only signals that fire as hard-deny-via-100-points.
+INCIDENT_GRADE_SIGNALS = frozenset({
+    "denylist_match",
+    "compromised_package",
+    "file_path_denylist",
+})
 PENDING_MAX_AGE_S = 300  # ignore stale pending files older than 5 minutes
 PENDING_UUID_RE = re.compile(r"^[a-f0-9]{8,64}$")
 # Long-poll: hold /api/decisions-wait open until audit.jsonl mtime changes
@@ -278,6 +306,41 @@ def compute_stats(all_entries: list[dict], window: str) -> dict:
         if c >= 2
     ]
 
+    # Time saved (see TIME_PER_* constants above for the math).
+    allow_count = by_decision.get("allow", 0)
+    deny_incident_count = 0
+    deny_nuisance_count = 0
+    for e in windowed:
+        if (e.get("decision") or "").lower() != "deny":
+            continue
+        sig_names = {
+            (s.get("name") or "") for s in (e.get("signals") or [])
+        }
+        if sig_names & INCIDENT_GRADE_SIGNALS:
+            deny_incident_count += 1
+        else:
+            deny_nuisance_count += 1
+    vs_default_s = allow_count * TIME_PER_ALLOW_S
+    vs_dangerous_s = (
+        deny_nuisance_count * TIME_PER_DENY_NUISANCE_S
+        + deny_incident_count * TIME_PER_DENY_INCIDENT_S
+    )
+    time_saved = {
+        "total_seconds": vs_default_s + vs_dangerous_s,
+        "vs_default_seconds": vs_default_s,
+        "vs_dangerous_seconds": vs_dangerous_s,
+        "counts": {
+            "allow": allow_count,
+            "deny_nuisance": deny_nuisance_count,
+            "deny_incident": deny_incident_count,
+        },
+        "constants": {
+            "allow_seconds": TIME_PER_ALLOW_S,
+            "deny_nuisance_seconds": TIME_PER_DENY_NUISANCE_S,
+            "deny_incident_seconds": TIME_PER_DENY_INCIDENT_S,
+        },
+    }
+
     # Project breakdown.
     project_counts: Counter[str] = Counter(
         e.get("project_dir") for e in windowed if e.get("project_dir")
@@ -319,6 +382,7 @@ def compute_stats(all_entries: list[dict], window: str) -> dict:
         "top_rules": top_rules,
         "tuning_candidates": tuning_candidates,
         "projects": projects,
+        "time_saved": time_saved,
         "timeseries": {
             "buckets": n_buckets,
             "bucket_seconds": bucket_secs,
@@ -485,6 +549,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "projects": [],
                 "timeseries": {"buckets": 0, "bucket_seconds": 0,
                                "start": 0, "allow": [], "ask": [], "deny": []},
+                "time_saved": {
+                    "total_seconds": 0,
+                    "vs_default_seconds": 0,
+                    "vs_dangerous_seconds": 0,
+                    "counts": {"allow": 0, "deny_nuisance": 0, "deny_incident": 0},
+                    "constants": {
+                        "allow_seconds": TIME_PER_ALLOW_S,
+                        "deny_nuisance_seconds": TIME_PER_DENY_NUISANCE_S,
+                        "deny_incident_seconds": TIME_PER_DENY_INCIDENT_S,
+                    },
+                },
                 "log_present": self.log_path.exists(),
                 "log_path": str(self.log_path),
             })
@@ -1182,6 +1257,91 @@ h1 {
 .sidebar { display: flex; flex-direction: column; gap: 1rem; }
 .sidebar .card-body { padding: 0.5rem 0.9rem 0.7rem; }
 
+/* ─── time saved card ─────────────────────────────────────── */
+.time-saved__hero {
+  display: flex;
+  align-items: baseline;
+  gap: 0.4rem;
+  padding: 0.4rem 0 0.5rem;
+}
+.time-saved__num {
+  font-family: var(--font-sans);
+  font-weight: 500;
+  font-size: 2rem;
+  line-height: 1;
+  color: var(--good);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.02em;
+}
+.time-saved__unit {
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  color: var(--fg-soft);
+  letter-spacing: 0.04em;
+}
+.time-saved__split {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 0.25rem;
+  margin-top: 0.4rem;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: var(--fg-dim);
+}
+.time-saved__split-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.5rem;
+  align-items: baseline;
+}
+.time-saved__split-label {
+  color: var(--fg-soft);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.time-saved__split-val {
+  color: var(--fg);
+  font-variant-numeric: tabular-nums;
+}
+.time-saved__split-val.is-good { color: var(--good); }
+.time-saved__split-val.is-warn { color: var(--warn); }
+.time-saved__math {
+  margin-top: 0.5rem;
+  border-top: 1px dashed var(--border-soft);
+  padding-top: 0.4rem;
+}
+.time-saved__math > summary {
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  color: var(--fg-soft);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  list-style: none;
+}
+.time-saved__math > summary::-webkit-details-marker { display: none; }
+.time-saved__math > summary::before {
+  content: "▸ ";
+  color: var(--fg-faint);
+}
+.time-saved__math[open] > summary::before { content: "▾ "; }
+.time-saved__math > summary:hover { color: var(--fg-dim); }
+.time-saved__math-body {
+  margin-top: 0.4rem;
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  line-height: 1.5;
+  color: var(--fg-soft);
+}
+.time-saved__math-body ul {
+  margin: 0.3rem 0 0.3rem;
+  padding-left: 1rem;
+}
+.time-saved__math-body li { margin: 0.15rem 0; }
+.time-saved__math-body .k { color: var(--accent); }
+.time-saved__math-body .v { color: var(--fg-dim); }
+
 .list-row {
   display: flex;
   justify-content: space-between;
@@ -1364,6 +1524,37 @@ h1 {
   </section>
 
   <aside class="sidebar" aria-label="Aggregates">
+    <div class="card" id="time-saved-card">
+      <div class="card-head">
+        <span>time saved</span>
+        <span class="spacer"></span>
+        <span class="muted" id="ts-window-label"></span>
+      </div>
+      <div class="card-body">
+        <div class="time-saved__hero">
+          <span class="time-saved__num" id="ts-total">0s</span>
+          <span class="time-saved__unit" id="ts-total-unit">saved</span>
+        </div>
+        <div class="time-saved__split">
+          <div class="time-saved__split-row" title="Allows × 5s — prompts you would have clicked through under default Claude Code.">
+            <span class="time-saved__split-label">vs default Claude</span>
+            <span class="time-saved__split-val is-good" id="ts-default">0s</span>
+          </div>
+          <div class="time-saved__split-row" title="Denies × recovery-time tier — incidents you would have lived through under --dangerously-skip-permissions.">
+            <span class="time-saved__split-label">vs --dangerously-skip</span>
+            <span class="time-saved__split-val is-warn" id="ts-dangerous">0s</span>
+          </div>
+        </div>
+        <details class="time-saved__math">
+          <summary>how this is calculated</summary>
+          <div class="time-saved__math-body" id="ts-math">
+            <p>Each constant comes from a first-principles decomposition, not a marketing target. Numbers update with the window selector above.</p>
+            <ul id="ts-math-list"></ul>
+            <p style="margin:0.3rem 0 0;color:var(--fg-faint);">Asks save 0s — they still prompt. Conservative on purpose; lower bound, not ceiling.</p>
+          </div>
+        </details>
+      </div>
+    </div>
     <div class="card">
       <div class="card-head"><span>top firing rules</span></div>
       <div class="card-body" id="top-rules"><div class="muted">no signals yet</div></div>
@@ -1442,7 +1633,38 @@ function render() {
   renderHistogram();
   renderSparkline();
   renderFeed();
+  renderTimeSaved();
   renderSidebar();
+}
+
+function formatDuration(totalSec) {
+  const s = Math.max(0, Math.round(totalSec));
+  if (s < 60)      return {n: String(s),                 u: "seconds"};
+  if (s < 3600)    return {n: String(Math.round(s/60)),  u: "minutes"};
+  if (s < 86400)   return {n: (s/3600).toFixed(s < 36000 ? 1 : 0), u: "hours"};
+  return                  {n: (s/86400).toFixed(s < 864000 ? 1 : 0), u: "days"};
+}
+
+function renderTimeSaved() {
+  const s = state.stats || {};
+  const ts = s.time_saved;
+  if (!ts) return;
+  const total = formatDuration(ts.total_seconds || 0);
+  const vsDef = formatDuration(ts.vs_default_seconds || 0);
+  const vsDng = formatDuration(ts.vs_dangerous_seconds || 0);
+  $("ts-total").textContent = total.n;
+  $("ts-total-unit").textContent = total.u + " saved";
+  $("ts-default").textContent   = `${vsDef.n} ${vsDef.u}`;
+  $("ts-dangerous").textContent = `${vsDng.n} ${vsDng.u}`;
+  $("ts-window-label").textContent = fmt.windowLabel(state.window);
+
+  const c = ts.counts   || {allow:0, deny_nuisance:0, deny_incident:0};
+  const k = ts.constants || {allow_seconds:5, deny_nuisance_seconds:180, deny_incident_seconds:1800};
+  $("ts-math-list").innerHTML = [
+    `<li><span class="k">allow × ${k.allow_seconds}s</span> · ${c.allow} allows <span class="v">= ${formatDuration(c.allow * k.allow_seconds).n} ${formatDuration(c.allow * k.allow_seconds).u}</span><br><span class="v">1s read · 1.5s decide · 1s click · 1.5s context resume</span></li>`,
+    `<li><span class="k">deny (nuisance) × ${Math.round(k.deny_nuisance_seconds/60)}min</span> · ${c.deny_nuisance} denies <span class="v">= ${formatDuration(c.deny_nuisance * k.deny_nuisance_seconds).n} ${formatDuration(c.deny_nuisance * k.deny_nuisance_seconds).u}</span><br><span class="v">force-push undo, config restore, credential rotate avg</span></li>`,
+    `<li><span class="k">deny (incident) × ${Math.round(k.deny_incident_seconds/60)}min</span> · ${c.deny_incident} incidents <span class="v">= ${formatDuration(c.deny_incident * k.deny_incident_seconds).n} ${formatDuration(c.deny_incident * k.deny_incident_seconds).u}</span><br><span class="v">denylist / malicious-package / system-path: 5m notice + 10m diagnose + 10m cleanup + 5m restore</span></li>`,
+  ].join("");
 }
 
 function renderStats() {

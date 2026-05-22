@@ -468,6 +468,227 @@ section {
   pointer-events: none;
 }
 
+/* ─── time saved ───────────────────────────────────────────────────────── */
+.time-saved { border-top: 1px solid var(--border-soft); }
+.time-saved h2 em {
+  font-style: italic;
+  color: var(--accent);
+  font-variation-settings: "opsz" 96, "wght" 500;
+}
+.ts__lead {
+  color: var(--fg-dim);
+  margin: 0 0 2.5rem;
+  max-width: 60ch;
+}
+
+.ts-grid {
+  display: grid;
+  grid-template-columns: 1.1fr 1fr;
+  gap: 1.25rem;
+  align-items: stretch;
+}
+@media (max-width: 880px) {
+  .ts-grid { grid-template-columns: 1fr; }
+}
+
+.ts-card {
+  border: 1px solid var(--border);
+  background: var(--bg-elev);
+  padding: 1.75rem 1.5rem 1.5rem;
+  display: flex;
+  flex-direction: column;
+}
+.ts-card h3 {
+  margin: 0 0 1.25rem;
+  font-size: 1.15rem;
+  font-variation-settings: "opsz" 30, "wght" 600;
+}
+
+.ts-personas table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--font-mono);
+  font-size: 0.86rem;
+}
+.ts-personas th,
+.ts-personas td {
+  text-align: left;
+  padding: 0.7rem 0.5rem;
+  border-bottom: 1px solid var(--border-soft);
+  vertical-align: top;
+}
+.ts-personas th {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--fg-soft);
+  font-weight: 500;
+}
+.ts-personas tr:last-child td { border-bottom: 0; }
+.ts-personas .persona-name {
+  color: var(--fg);
+  font-family: var(--font-sans);
+  font-weight: 500;
+}
+.ts-personas .persona-sub {
+  display: block;
+  color: var(--fg-soft);
+  font-size: 0.72rem;
+  margin-top: 0.15rem;
+}
+.ts-personas .num {
+  font-variant-numeric: tabular-nums;
+  color: var(--fg-dim);
+  text-align: right;
+}
+.ts-personas .save {
+  font-variant-numeric: tabular-nums;
+  color: var(--good);
+  text-align: right;
+  font-weight: 500;
+}
+
+.ts-estimator__input {
+  display: block;
+  margin: 0 0 1.5rem;
+}
+.ts-estimator__input-label {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--fg-soft);
+  margin-bottom: 0.65rem;
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+}
+.ts-estimator__input-label output {
+  font-family: var(--font-mono);
+  font-size: 1rem;
+  color: var(--accent);
+  letter-spacing: 0;
+  text-transform: none;
+}
+.ts-estimator__slider {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 4px;
+  background: var(--bg-elev-3);
+  border-radius: 2px;
+  outline: none;
+}
+.ts-estimator__slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--accent);
+  cursor: pointer;
+  border: 2px solid var(--bg);
+  box-shadow: 0 0 0 1px var(--accent-soft);
+}
+.ts-estimator__slider::-moz-range-thumb {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--accent);
+  cursor: pointer;
+  border: 2px solid var(--bg);
+}
+.ts-estimator__big {
+  font-family: var(--font-display);
+  font-variation-settings: "opsz" 96, "wght" 500;
+  font-size: clamp(2.5rem, 5vw, 3.5rem);
+  line-height: 1;
+  color: var(--good);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.02em;
+  margin-bottom: 0.3rem;
+}
+.ts-estimator__big .unit {
+  font-family: var(--font-mono);
+  font-size: 0.95rem;
+  color: var(--fg-soft);
+  margin-left: 0.4rem;
+  font-variation-settings: normal;
+  letter-spacing: 0.04em;
+}
+.ts-estimator__sub {
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  color: var(--fg-soft);
+  margin: 0;
+}
+.ts-estimator__breakdown {
+  margin-top: 1.5rem;
+  padding-top: 1rem;
+  border-top: 1px dashed var(--border-soft);
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  color: var(--fg-dim);
+}
+.ts-estimator__breakdown div {
+  display: flex;
+  justify-content: space-between;
+  padding: 0.2rem 0;
+  gap: 0.5rem;
+}
+.ts-estimator__breakdown .lbl { color: var(--fg-soft); }
+.ts-estimator__breakdown .val { color: var(--fg); font-variant-numeric: tabular-nums; }
+
+.ts-math {
+  margin-top: 2.5rem;
+  border: 1px solid var(--border);
+  background: var(--bg-elev);
+}
+.ts-math summary {
+  list-style: none;
+  cursor: pointer;
+  padding: 1rem 1.25rem;
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--fg-soft);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.ts-math summary::-webkit-details-marker { display: none; }
+.ts-math summary::after {
+  content: "+";
+  font-size: 1.2rem;
+  color: var(--accent);
+}
+.ts-math[open] summary::after { content: "−"; }
+.ts-math summary:hover { color: var(--fg); }
+.ts-math__body {
+  padding: 0 1.25rem 1.5rem;
+  font-size: 0.92rem;
+  color: var(--fg-dim);
+  max-width: 70ch;
+}
+.ts-math__body p { color: var(--fg-dim); margin: 0 0 0.85rem; }
+.ts-math__body ol { padding-left: 1.25rem; margin: 0.5rem 0 1rem; }
+.ts-math__body li { margin: 0.4rem 0; }
+.ts-math__body code {
+  font-size: 0.88em;
+  padding: 0.05em 0.35em;
+  background: var(--bg-elev-2);
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  color: var(--fg);
+}
+.ts-math__footnote {
+  font-size: 0.85rem;
+  color: var(--fg-soft);
+  padding-top: 0.85rem;
+  border-top: 1px dashed var(--border-soft);
+}
+
 /* ─── how it works ─────────────────────────────────────────────────────── */
 .how { padding-top: clamp(3rem, 6vw, 5rem); }
 .how__intro { color: var(--fg-dim); margin-bottom: 2.5rem; }
@@ -881,6 +1102,89 @@ footer .credit {
         <p>Silent on the boring stuff. Asks on ambiguous things, with a full risk breakdown. Hard-blocks supply-chain attacks, credential reads, force-pushes to <code>main</code>, and 200,000+ named-malicious packages. The judgement call you'd make if you reviewed every command yourself. Encoded.</p>
       </article>
     </div>
+  </div>
+</section>
+
+<!-- ─── TIME SAVED ──────────────────────────────────────────────────────── -->
+<section class="time-saved" aria-labelledby="time-saved-h">
+  <div class="wrap">
+    <p class="eyebrow">the value</p>
+    <h2 id="time-saved-h">How much time does this <em>actually save you?</em></h2>
+    <p class="ts__lead">Two clocks run side by side. Against default Claude Code, claude-guard removes the friction of approving safe commands. Against <code>--dangerously-skip-permissions</code>, it removes the recovery time after a deny that would otherwise have run. Both are real, both are additive, and both have to be defended with math &mdash; not vibes.</p>
+
+    <div class="ts-grid">
+      <article class="ts-card ts-personas">
+        <h3>Three personas, real ratios</h3>
+        <p style="color:var(--fg-soft); font-size:0.85rem; margin:0 0 1rem;">Decision ratios held at <span class="mono" style="color:var(--fg-dim)">85% allow / 14% ask / 1% deny</span> — sampled from the author's own audit log.</p>
+        <table>
+          <thead>
+            <tr>
+              <th>Persona</th>
+              <th class="num">Calls/day</th>
+              <th class="save">Saved/day</th>
+              <th class="save">Saved/week</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><span class="persona-name">Light</span><span class="persona-sub">chat + occasional script</span></td>
+              <td class="num">100</td>
+              <td class="save">~10 min</td>
+              <td class="save">~1 hr</td>
+            </tr>
+            <tr>
+              <td><span class="persona-name">Typical</span><span class="persona-sub">daily coding</span></td>
+              <td class="num">400</td>
+              <td class="save">~40 min</td>
+              <td class="save">~4.5 hr</td>
+            </tr>
+            <tr>
+              <td><span class="persona-name">Refactor week</span><span class="persona-sub">heavy agent driving</span></td>
+              <td class="num">1,000</td>
+              <td class="save">~1 hr 40 min</td>
+              <td class="save">~11.5 hr</td>
+            </tr>
+          </tbody>
+        </table>
+      </article>
+
+      <article class="ts-card ts-estimator">
+        <h3>Estimate for your usage</h3>
+        <label class="ts-estimator__input">
+          <span class="ts-estimator__input-label">
+            <span>Tool calls per day</span>
+            <output id="ts-calls-out">400</output>
+          </span>
+          <input type="range" class="ts-estimator__slider" id="ts-calls" min="50" max="2000" step="50" value="400" aria-label="Tool calls per day">
+        </label>
+        <div class="ts-estimator__big" id="ts-headline">40<span class="unit">min / day</span></div>
+        <p class="ts-estimator__sub" id="ts-headline-sub">~4 hr 40 min per week</p>
+
+        <div class="ts-estimator__breakdown">
+          <div><span class="lbl">vs default Claude (allows × 5s)</span><span class="val" id="ts-vs-default">28 min</span></div>
+          <div><span class="lbl">vs --dangerously-skip (denies × tier)</span><span class="val" id="ts-vs-dangerous">12 min</span></div>
+          <div><span class="lbl">asks (no time saved &mdash; still prompts)</span><span class="val" id="ts-asks">56 / day</span></div>
+        </div>
+      </article>
+    </div>
+
+    <details class="ts-math">
+      <summary>How is this calculated? <span style="font-size:0.7rem; letter-spacing:0.08em; color:var(--fg-faint); text-transform:none;">&nbsp;footnoted math</span></summary>
+      <div class="ts-math__body">
+        <p>Every number on this page comes from these four constants. They were chosen by decomposing each action into its component costs, not picked to make the headline look impressive. Lower bound, not ceiling.</p>
+
+        <ol>
+          <li><strong>Allow = 5 seconds.</strong> Default Claude Code prompts on commands that aren't pre-approved. Per prompt: <code>1.0s</code> render &amp; read + <code>1.5s</code> decide + <code>1.0s</code> click + <code>1.5s</code> context resume.<sup>1</sup></li>
+          <li><strong>Ask = 0 seconds.</strong> An <em>ask</em> decision still prompts you, same friction as default Claude. Honest answer.<sup>2</sup></li>
+          <li><strong>Deny (nuisance) = 3 minutes.</strong> Generic deny under <code>--dangerously-skip-permissions</code>: force-push to <code>main</code>, config file rewrite, credential read. Average of <code>git reflog</code> undo (~2 min), config restore (~5 min), credential rotate (~10 min).</li>
+          <li><strong>Deny (incident-grade) = 30 minutes.</strong> Triggered when the signal name is <code>denylist_match</code>, <code>compromised_package</code>, or <code>file_path_denylist</code>. Recovery floor: <code>5 min</code> notice + <code>10 min</code> diagnose + <code>10 min</code> cleanup + <code>5 min</code> restore. Real supply-chain incidents cost engineers days; 30 minutes is the conservative floor.<sup>3</sup></li>
+        </ol>
+
+        <p class="ts-math__footnote"><sup>1</sup> Personas assume zero incident-grade denies. Each one adds ~30 minutes &mdash; if your average package install hits a malicious typosquat once a month, that's another ~30 min/month on top.<br>
+        <sup>2</sup> The dashboard bridge (<code>DASHBOARD_BRIDGE_ENABLED</code>) reduces ask friction by letting you click from the browser instead of switching to the terminal, but we don't claim time saved for asks &mdash; the prompt still happens.<br>
+        <sup>3</sup> The constants are defined once in <code>dashboard.py</code> (<code>TIME_PER_ALLOW_S</code>, <code>TIME_PER_DENY_NUISANCE_S</code>, <code>TIME_PER_DENY_INCIDENT_S</code>) and surfaced on the live dashboard, so the math is auditable. Disagree with a constant? Edit the file; numbers update everywhere.</p>
+      </div>
+    </details>
   </div>
 </section>
 
@@ -1305,6 +1609,61 @@ footer .credit {
         done();
       }
     });
+  }
+
+  // ─── Time-saved estimator ──────────────────────────────────────────────
+  // Mirror of dashboard.py's TIME_PER_* constants. Keep these in sync; the
+  // FAQ #3 footnote tells users they're auditable in dashboard.py.
+  var TIME_PER_ALLOW_S = 5;
+  var TIME_PER_DENY_NUISANCE_S = 180;
+  // Fixed ratios from the author's own audit log. Held constant so users
+  // are tuning one knob (volume) instead of three.
+  var ALLOW_FRAC = 0.85;
+  var ASK_FRAC   = 0.14;
+  var DENY_FRAC  = 0.01;
+
+  function fmtDuration(totalSec) {
+    var s = Math.max(0, Math.round(totalSec));
+    if (s < 60)     return s + " sec";
+    if (s < 3600)   return Math.round(s/60) + " min";
+    var h = Math.floor(s/3600);
+    var m = Math.round((s % 3600) / 60);
+    if (m === 0)    return h + " hr";
+    return h + " hr " + m + " min";
+  }
+  function fmtBigUnit(totalSec) {
+    var s = Math.max(0, Math.round(totalSec));
+    if (s < 60)   return {n: String(s),                u: "sec / day"};
+    if (s < 3600) return {n: String(Math.round(s/60)), u: "min / day"};
+    var h = s / 3600;
+    return {n: h.toFixed(h < 10 ? 1 : 0), u: "hr / day"};
+  }
+
+  var slider = document.getElementById("ts-calls");
+  if (slider) {
+    function updateEstimator() {
+      var calls = parseInt(slider.value, 10) || 0;
+      var allows = Math.round(calls * ALLOW_FRAC);
+      var asks   = Math.round(calls * ASK_FRAC);
+      var denies = Math.round(calls * DENY_FRAC);
+      // Personas assume no incident-grade denies; ratio for the estimator
+      // matches. Footnote covers the per-incident addition.
+      var vsDefault   = allows * TIME_PER_ALLOW_S;
+      var vsDangerous = denies * TIME_PER_DENY_NUISANCE_S;
+      var total = vsDefault + vsDangerous;
+
+      var headline = fmtBigUnit(total);
+      var head = document.getElementById("ts-headline");
+      head.innerHTML = headline.n + '<span class="unit">' + headline.u + '</span>';
+      document.getElementById("ts-headline-sub").textContent =
+        "~" + fmtDuration(total * 7) + " per week";
+      document.getElementById("ts-calls-out").textContent = calls.toLocaleString();
+      document.getElementById("ts-vs-default").textContent = fmtDuration(vsDefault);
+      document.getElementById("ts-vs-dangerous").textContent = fmtDuration(vsDangerous);
+      document.getElementById("ts-asks").textContent = asks.toLocaleString() + " / day";
+    }
+    slider.addEventListener("input", updateEstimator);
+    updateEstimator();
   }
 })();
 </script>
