@@ -1539,13 +1539,17 @@ function renderFeed() {
   const feedEl = $("feed");
   const entries = state.entries || [];
   if (!entries.length) {
-    feedEl.innerHTML = "";
-    feedEl.appendChild($("empty"));
-    $("empty").hidden = false;
+    // Don't reuse the boot-time #empty element; it gets wiped out the first
+    // time we replace feedEl.innerHTML with rows, so subsequent lookups
+    // would NPE. Always re-render the empty state from scratch.
+    feedEl.innerHTML = `
+      <div class="empty" id="empty">
+        <div>waiting for activity…</div>
+        <div class="hint">run any Bash, Edit, Write, WebFetch, WebSearch, or MCP tool in Claude Code to see it appear here.</div>
+      </div>`;
     $("feed-count").textContent = "0 shown";
     return;
   }
-  $("empty").hidden = true;
   // Mark rows whose key is not in seenDecisionKeys yet — they'll flash in.
   // Seed runs on the first poll so we don't flash every row at boot.
   let html = "";
