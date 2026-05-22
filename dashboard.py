@@ -40,6 +40,10 @@ TOP_N = 10
 DECISION_LIMIT = 200
 PENDING_MAX_AGE_S = 300  # ignore stale pending files older than 5 minutes
 PENDING_UUID_RE = re.compile(r"^[a-f0-9]{8,64}$")
+# Long-poll: hold /api/decisions-wait open until audit.jsonl mtime changes
+# or this many seconds elapse, then respond. Browser immediately reconnects.
+LONG_POLL_TIMEOUT_S = 25
+LONG_POLL_TICK_S = 0.1
 
 # Window selector values map to a duration in seconds. "all" means no cutoff.
 WINDOWS = {
@@ -415,6 +419,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._serve_stats(parse_qs(parsed.query))
         elif parsed.path == "/api/decisions":
             self._serve_decisions(parse_qs(parsed.query))
+        elif parsed.path == "/api/decisions-wait":
+            self._serve_decisions_wait(parse_qs(parsed.query))
         elif parsed.path == "/api/pending":
             self._serve_pending()
         elif parsed.path == "/api/health":
@@ -510,6 +516,68 @@ class DashboardHandler(BaseHTTPRequestHandler):
             "filter": decision_filter,
             "q": query,
         })
+
+    def _serve_decisions_wait(self, params: dict) -> None:
+        """Long-poll the decisions feed. Hangs until audit.jsonl's mtime is
+        newer than the client's `since` value, or until LONG_POLL_TIMEOUT_S
+        elapses. Browser is expected to immediately re-request.
+
+        The 25s ceiling stays well under any proxy / reverse-proxy idle
+        timeout the user might sit behind. With ThreadingHTTPServer each
+        long-poll holds one server thread; this is single-user so that's
+        fine. The browser aborts the request when filter/window/search
+        change, which closes the socket and lets the thread exit on its
+        next tick."""
+        window = _qparam(params, "window", "24h")
+        if window not in WINDOWS:
+            window = "24h"
+        decision_filter = _qparam(params, "filter", "all").lower()
+        query = _qparam(params, "q", "")
+        try:
+            limit = max(1, min(int(_qparam(params, "limit", str(DECISION_LIMIT))), 2000))
+        except (TypeError, ValueError):
+            limit = DECISION_LIMIT
+        try:
+            since = float(_qparam(params, "since", "0"))
+        except ValueError:
+            since = 0.0
+
+        deadline = time.time() + LONG_POLL_TIMEOUT_S
+        while True:
+            try:
+                current_mtime = self.log_path.stat().st_mtime
+            except OSError:
+                current_mtime = 0.0
+
+            if current_mtime > since:
+                # New data — return immediately.
+                entries = read_audit_log(self.log_path)
+                entries = filter_by_window(entries, window)
+                entries = filter_decisions(entries, decision_filter, query)
+                entries.reverse()
+                self._serve_json({
+                    "entries": entries[:limit],
+                    "total_matched": len(entries),
+                    "window": window,
+                    "filter": decision_filter,
+                    "q": query,
+                    "mtime": current_mtime,
+                    "timeout": False,
+                })
+                return
+
+            if time.time() >= deadline:
+                # No change — respond so the browser can reconnect with a
+                # fresh request. Keeps connections from sitting open longer
+                # than any reasonable proxy will tolerate.
+                self._serve_json({
+                    "entries": None,
+                    "mtime": current_mtime,
+                    "timeout": True,
+                })
+                return
+
+            time.sleep(LONG_POLL_TICK_S)
 
     def _serve_pending(self) -> None:
         items = list_pending(self.log_path)
@@ -1314,9 +1382,9 @@ h1 {
 </main>
 
 <script>
-const POLL_MS = 1000;
 const PENDING_POLL_MS = 1000;
 const FEED_LIMIT = 200;
+const RECONNECT_BACKOFF_MS = 1500;
 const $ = (id) => document.getElementById(id);
 
 // Persisted prefs (survives reloads). Default ON for ask/deny notifications
@@ -1333,12 +1401,14 @@ const state = {
   stats:   null,
   open:    new Set(),     // expanded rows, keyed by ts+command
   lastOk:  0,
-  pollPending: false,
   pending: [],
   seenPendingIds: new Set(),
   acting: new Set(),      // pending uuids whose buttons are mid-action
   seenDecisionKeys: new Set(),  // rowKey strings we've already shown
   bootDone: false,        // first poll seeds seen-set without notifying
+  lastMtime: 0,           // last-seen audit.jsonl mtime for long-poll
+  longPollAbort: null,    // AbortController for the in-flight long-poll
+  reconnectTimer: null,
 };
 
 const fmt = {
@@ -1584,35 +1654,107 @@ function renderSidebar() {
   }
 }
 
-// ─── polling ───────────────────────────────────────────────────────────
-async function poll() {
-  if (state.pollPending) return;
-  state.pollPending = true;
+// ─── long-poll ────────────────────────────────────────────────────────
+// The feed is push-style: a long-running GET hangs until audit.jsonl mtime
+// changes server-side, then the browser fires the next request. Worst-case
+// latency from hook-writes-log to dashboard-updates is the round-trip plus
+// the server's 100ms mtime tick — typically <150ms.
+
+async function loadInitial() {
+  // First-paint: fetch stats + a snapshot of decisions so the page isn't
+  // empty while we wait for the first long-poll response.
   try {
     const win = encodeURIComponent(state.window);
     const filt = encodeURIComponent(state.filter);
     const q = encodeURIComponent(state.search);
     const [statsRes, decsRes] = await Promise.all([
-      fetch(`/api/stats?window=${win}`, {cache:"no-store"}),
-      fetch(`/api/decisions?window=${win}&filter=${filt}&q=${q}&limit=${FEED_LIMIT}`, {cache:"no-store"}),
+      fetch(`/api/stats?window=${win}`, {cache: "no-store"}),
+      fetch(`/api/decisions?window=${win}&filter=${filt}&q=${q}&limit=${FEED_LIMIT}`, {cache: "no-store"}),
     ]);
-    if (!statsRes.ok || !decsRes.ok) throw new Error("api error");
+    if (!statsRes.ok || !decsRes.ok) throw new Error("initial fetch failed");
     const [stats, decs] = await Promise.all([statsRes.json(), decsRes.json()]);
     state.stats = stats;
     state.entries = decs.entries || [];
+    // Seed seenDecisionKeys so the boot doesn't fire notifications for the
+    // existing backlog. notifyOnNewDecisions also handles this via bootDone.
+    notifyOnNewDecisions(state.entries);
     state.lastOk = Date.now();
     setLive("live", "live");
-
-    // Surface notifications for new ask / deny entries. The first poll
-    // seeds seenDecisionKeys silently so we don't fire on backlog at load.
-    notifyOnNewDecisions(state.entries);
-
     render();
   } catch (e) {
     setLive("stale", "reconnecting…");
-  } finally {
-    state.pollPending = false;
   }
+}
+
+async function refreshStats() {
+  try {
+    const win = encodeURIComponent(state.window);
+    const r = await fetch(`/api/stats?window=${win}`, {cache: "no-store"});
+    if (r.ok) state.stats = await r.json();
+  } catch (e) { /* leave stale stats in place */ }
+}
+
+// Cancel any in-flight long-poll. Used when filter / window / search
+// changes so the next loop iteration uses the new params.
+function abortLongPoll() {
+  if (state.longPollAbort) {
+    try { state.longPollAbort.abort(); } catch (e) {}
+    state.longPollAbort = null;
+  }
+  if (state.reconnectTimer) {
+    clearTimeout(state.reconnectTimer);
+    state.reconnectTimer = null;
+  }
+}
+
+async function longPoll() {
+  abortLongPoll();
+  state.longPollAbort = new AbortController();
+  const params = new URLSearchParams({
+    since: String(state.lastMtime),
+    window: state.window,
+    filter: state.filter,
+    q: state.search,
+    limit: String(FEED_LIMIT),
+  });
+  try {
+    const r = await fetch(`/api/decisions-wait?${params.toString()}`, {
+      cache: "no-store",
+      signal: state.longPollAbort.signal,
+    });
+    if (!r.ok) throw new Error("api error " + r.status);
+    const data = await r.json();
+    if (typeof data.mtime === "number") {
+      state.lastMtime = data.mtime;
+    }
+    if (!data.timeout && Array.isArray(data.entries)) {
+      // Real change: update entries, fire notifications, refresh aggregates.
+      state.entries = data.entries;
+      notifyOnNewDecisions(state.entries);
+      render();
+      // Aggregates fire in the background; rendering the feed first keeps
+      // perceived latency low.
+      refreshStats().then(render);
+    }
+    state.lastOk = Date.now();
+    setLive("live", "live");
+    // Immediately reconnect.
+    longPoll();
+  } catch (e) {
+    if (e && e.name === "AbortError") return;  // intentional cancel
+    setLive("stale", "reconnecting…");
+    state.reconnectTimer = setTimeout(longPoll, RECONNECT_BACKOFF_MS);
+  }
+}
+
+// Called from input handlers when the user changes window / filter / search.
+// Drops the in-flight long-poll (which was waiting with the old params),
+// refreshes stats + a snapshot, then restarts the long-poll loop.
+async function refilterAndRestart() {
+  abortLongPoll();
+  state.lastMtime = 0;  // force the next long-poll to return immediately
+  await loadInitial();
+  longPoll();
 }
 
 function notifyOnNewDecisions(entries) {
@@ -1809,7 +1951,7 @@ document.querySelectorAll(".window-bar button").forEach(b => {
     document.querySelectorAll(".window-bar button").forEach(x => x.setAttribute("aria-pressed", "false"));
     b.setAttribute("aria-pressed", "true");
     state.window = b.dataset.window;
-    poll();
+    refilterAndRestart();
   });
 });
 document.querySelectorAll(".chip[data-filter]").forEach(b => {
@@ -1817,14 +1959,14 @@ document.querySelectorAll(".chip[data-filter]").forEach(b => {
     document.querySelectorAll(".chip[data-filter]").forEach(x => x.setAttribute("aria-pressed", "false"));
     b.setAttribute("aria-pressed", "true");
     state.filter = b.dataset.filter;
-    poll();
+    refilterAndRestart();
   });
 });
 let searchDebounce;
 $("search").addEventListener("input", (e) => {
   state.search = e.target.value;
   clearTimeout(searchDebounce);
-  searchDebounce = setTimeout(poll, 200);
+  searchDebounce = setTimeout(refilterAndRestart, 200);
 });
 
 // keyboard: "/" focuses search
@@ -1835,16 +1977,29 @@ document.addEventListener("keydown", (e) => {
   }
 });
 
-// Initial poll + interval
-poll();
-setInterval(poll, POLL_MS);
+// Boot: snapshot first, then start the long-poll loop. The snapshot paints
+// instantly; the long-poll then hangs until audit.jsonl changes.
+(async function boot() {
+  await loadInitial();
+  longPoll();
+})();
 
-// Pending bridge: 1s poll, separate stream so it stays responsive even when
-// the main stats poll is in flight or stalled.
+// Pending bridge: 1s short-poll (different file system, different file per
+// pending decision, no good mtime aggregate to long-poll on).
 maybeRequestNotificationPermission();
 refreshNotifyToggle();
 pollPending();
 setInterval(pollPending, PENDING_POLL_MS);
+
+// When the tab is backgrounded then re-foregrounded, browsers may have
+// suspended the long-poll. Kick it back to life on visibility return.
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" &&
+      Date.now() - state.lastOk > 5000) {
+    abortLongPoll();
+    longPoll();
+  }
+});
 
 // Notify-toggle wiring
 $("notify-toggle").addEventListener("click", toggleNotify);
