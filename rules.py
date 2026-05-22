@@ -831,6 +831,39 @@ FILE_PATH_SENSITIVE_PATTERNS = [
      "points": 50, "reason": "Modifying shell startup profile"},
 ]
 
+# MCP servers whose tool calls should be auto-allowed regardless of score.
+# These are first-party / well-known integrations whose calls are otherwise
+# noisy in the ask-band. The decision is allow with score 0 and a single
+# `trusted_mcp_server` signal recorded in the audit log, so the user can see
+# why the call skipped scoring. To revoke trust for one, remove its slug.
+# The check runs after DENYLIST so a compromised trusted server still can't
+# bypass hardcoded blocks.
+TRUSTED_MCP_SERVERS = {
+    "playwright",
+    "figma",
+    "canva",
+    "notion",
+    "asana",
+    "intercom",
+    "hubspot",
+    "atlassian",
+    "box",
+    "linear",
+    "google-calendar",
+    "google-cloud-bigquery",
+    "gmail",
+    "monday-com",
+    "ide",
+    # Add more as Anthropic ships official integrations.
+    #
+    # Matching: the MCP tool name is `mcp__<server>__<action>`; the server
+    # segment is lowercased, has any leading `claude-ai-` stripped, and `_`
+    # converted to `-`, then the result is checked against this set. So
+    # `mcp__claude_ai_Figma__get_design_context` looks up "figma", and
+    # `mcp__playwright__browser_click` looks up "playwright".
+}
+
+
 # Read-only / safe MCP tool name patterns. Matched against the full tool_name
 # (e.g. "mcp__claude_ai_Linear__authenticate"). Server names can contain single
 # underscores, so the server segment is matched non-greedily up to `__`.

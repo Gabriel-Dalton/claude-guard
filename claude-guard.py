@@ -67,6 +67,7 @@ try:
         FILE_PATH_SENSITIVE_PATTERNS,
         MCP_READONLY_COMPILED,
         MCP_HIGH_RISK_COMPILED,
+        TRUSTED_MCP_SERVERS,
     )
 except Exception as _e:  # ImportError, SyntaxError, NameError, etc.
     _RULES_LOAD_ERROR = (
@@ -81,6 +82,7 @@ except Exception as _e:  # ImportError, SyntaxError, NameError, etc.
     FILE_PATH_SENSITIVE_PATTERNS = []
     MCP_READONLY_COMPILED = []
     MCP_HIGH_RISK_COMPILED = []
+    TRUSTED_MCP_SERVERS = set()
     FAIL_MODE = _FAIL_MODE_DEFAULT
 
 
@@ -562,14 +564,41 @@ def evaluate_web(tool_name: str, tool_input: dict, project_dir: Path):
     return 10, [sig], False, False, ctx
 
 
+def _mcp_server_slug(tool_name: str) -> str:
+    """Extract and normalize the server slug from an MCP tool name.
+
+    `mcp__<server>__<action>` -> server lowercased, leading `claude-ai-`
+    stripped, `_` converted to `-`. Used for trusted-server lookups.
+    """
+    if not tool_name.startswith("mcp__"):
+        return ""
+    rest = tool_name[5:]
+    server, _sep, _action = rest.partition("__")
+    norm = server.lower().replace("_", "-")
+    if norm.startswith("claude-ai-"):
+        norm = norm[len("claude-ai-"):]
+    return norm
+
+
 def evaluate_mcp(tool_name: str, tool_input: dict, project_dir: Path):
     """Score MCP tool calls by tool-name pattern.
 
-    Read-only patterns auto-allow. Known write/action patterns push to ask.
-    Anything else falls in the ask band by default.
+    Trusted-server short-circuit (placed after the global Bash DENYLIST that
+    runs in main() — denylist still trumps everything for non-MCP tools, and
+    no MCP-specific denylist exists yet, so a trusted server is the first
+    matching rule here). Otherwise: read-only patterns auto-allow, known
+    write/action patterns push to ask, anything else falls in the ask band.
     """
     summary = f"{tool_name}:{json.dumps(tool_input)[:160]}"
     ctx = _synthesize_ctx(tool_name, summary, project_dir)
+
+    server_slug = _mcp_server_slug(tool_name)
+    if server_slug and server_slug in TRUSTED_MCP_SERVERS:
+        sig = Signal(
+            "trusted_mcp_server", 0,
+            f"Tool is from trusted MCP server '{server_slug}'",
+        )
+        return 0, [sig], True, False, ctx
 
     for cp in MCP_READONLY_COMPILED:
         if cp.search(tool_name):
