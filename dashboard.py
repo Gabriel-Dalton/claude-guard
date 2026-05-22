@@ -1163,36 +1163,70 @@ h1 {
   100% { background: transparent; }
 }
 
-/* ─── status bar toggle ─────────────────────────────────────── */
-.notify-toggle {
+/* ─── status-bar icon button ────────────────────────────────── */
+/* Quiet by default (matches the status bar's tiny / subtle vocabulary).
+   State lives entirely in the icon — no text label, no decorative dot.
+   Tooltip explains the state on hover. */
+.iconbtn {
+  appearance: none;
   display: inline-flex;
   align-items: center;
-  gap: 0.35rem;
-  font-family: var(--font-mono);
-  font-size: 0.7rem;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  padding: 0.2rem 0.55rem;
-  margin-right: 0.5rem;
-  border-radius: 999px;
-  border: 1px solid var(--border);
-  background: var(--bg-elev);
-  color: var(--fg-soft);
-  transition: color 0.12s ease, border-color 0.12s ease;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  margin: -2px 0 -2px 0.25rem;     /* compensate height so it fits the bar */
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--fg-faint);
+  cursor: pointer;
+  transition: color 120ms ease, background 120ms ease, border-color 120ms ease;
 }
-.notify-toggle:hover { color: var(--fg); border-color: var(--accent-soft); }
-.notify-toggle[aria-pressed="true"] {
+.iconbtn:hover {
+  color: var(--fg);
+  background: var(--bg-elev-2);
+}
+.iconbtn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.iconbtn svg {
+  width: 14px;
+  height: 14px;
+  display: block;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  fill: none;
+  overflow: visible;          /* slash extends past the bell bounds when on */
+}
+.iconbtn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+.iconbtn .iconbtn-slash { opacity: 0; }      /* hidden unless .blocked */
+
+/* On = accent, bell body subtly filled. */
+.iconbtn[aria-pressed="true"] {
   color: var(--accent);
-  border-color: var(--accent-soft);
-  background: var(--accent-tint);
 }
-.notify-toggle::before {
-  content: "";
-  width: 6px; height: 6px;
-  border-radius: 50%;
-  background: var(--fg-faint);
+.iconbtn[aria-pressed="true"] .iconbtn-bell {
+  fill: var(--accent-tint);
 }
-.notify-toggle[aria-pressed="true"]::before { background: var(--accent); }
+
+/* Blocked = the user wants notifications but the browser denied permission.
+   Show the bell with a strikethrough so the state is unambiguous. */
+.iconbtn.blocked {
+  color: var(--bad);
+}
+.iconbtn.blocked .iconbtn-bell {
+  fill: var(--bad-tint);
+}
+.iconbtn.blocked .iconbtn-slash {
+  opacity: 1;
+}
 
 .row-detail {
   display: none;
@@ -1412,9 +1446,15 @@ h1 {
   </span>
   <span class="path" id="log-path" aria-label="audit log location">~/.claude/guard/audit.jsonl</span>
   <span class="spacer"></span>
-  <button class="notify-toggle" id="notify-toggle" type="button"
-          aria-pressed="false" title="Browser notifications for ask / deny decisions">
-    notify
+  <button class="iconbtn" id="notify-toggle" type="button"
+          aria-pressed="false"
+          aria-label="Toggle browser notifications for ask and deny decisions"
+          title="Notifications">
+    <svg viewBox="0 0 20 20" aria-hidden="true">
+      <path class="iconbtn-bell" d="M5 13.5l1-1V9a4 4 0 0 1 8 0v3.5l1 1z"/>
+      <path class="iconbtn-clapper" d="M8.5 15.5a1.5 1.5 0 0 0 3 0"/>
+      <line class="iconbtn-slash" x1="3.5" y1="3.5" x2="16.5" y2="16.5"/>
+    </svg>
   </button>
   <span class="live idle" id="live" aria-live="polite">
     <span class="live-pip" aria-hidden="true"></span>
@@ -2137,24 +2177,26 @@ function maybeRequestNotificationPermission() {
 function refreshNotifyToggle() {
   const btn = $("notify-toggle");
   if (!btn) return;
-  const granted = ("Notification" in window) && Notification.permission === "granted";
-  const on = PREFS.notify && granted;
-  btn.setAttribute("aria-pressed", on ? "true" : "false");
+  // No-API case: bell stays grey, button disabled.
   if (!("Notification" in window)) {
-    btn.textContent = "no notif";
-    btn.title = "Browser does not support the Notification API";
+    btn.setAttribute("aria-pressed", "false");
+    btn.classList.remove("blocked");
     btn.disabled = true;
+    btn.title = "This browser doesn't support notifications";
     return;
   }
-  if (!PREFS.notify) {
-    btn.textContent = "notify: off";
-    btn.title = "Click to enable browser notifications for ask / deny";
-  } else if (!granted) {
-    btn.textContent = "notify: blocked";
-    btn.title = "Browser hasn't granted permission. Click to request again.";
+  btn.disabled = false;
+  const granted = Notification.permission === "granted";
+  const on = PREFS.notify && granted;
+  const blocked = PREFS.notify && !granted;
+  btn.setAttribute("aria-pressed", on ? "true" : "false");
+  btn.classList.toggle("blocked", blocked);
+  if (on) {
+    btn.title = "Notifications on. Click to mute.";
+  } else if (blocked) {
+    btn.title = "Notifications blocked by browser. Click to retry the permission prompt.";
   } else {
-    btn.textContent = "notify: on";
-    btn.title = "Browser notifications enabled for ask / deny. Click to mute.";
+    btn.title = "Notifications muted. Click to enable.";
   }
 }
 
