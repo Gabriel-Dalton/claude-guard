@@ -911,8 +911,7 @@ footer .credit {
 <span class="b">┌─────────┐</span>   <span class="b">┌──────────┐</span>     <span class="b">┌──────────┐</span>
 <span class="b">│</span> <span class="g">ALLOW</span>   <span class="b">│</span>   <span class="b">│</span>   <span class="w">ASK</span>    <span class="b">│</span>     <span class="b">│</span>   <span class="r">DENY</span>   <span class="b">│</span>
 <span class="b">│</span> silent  <span class="b">│</span>   <span class="b">│</span> + breakdown <span class="b">│</span>    <span class="b">│</span> blocked  <span class="b">│</span>
-<span class="b">└─────────┘</span>   <span class="b">│</span> + LLM opt. <span class="b">│</span>     <span class="b">└──────────┘</span>
-              <span class="b">└──────────┘</span></code></pre>
+<span class="b">└─────────┘</span>   <span class="b">└──────────┘</span>     <span class="b">└──────────┘</span></code></pre>
     </figure>
 
     <h3 class="examples-head">Real examples, from the live test suite</h3>
@@ -972,12 +971,6 @@ footer .credit {
         <span class="feature__tag">threat feed</span>
         <h3>223,000+ malicious packages, auto-refreshed</h3>
         <p>Live OSV.dev <code>MAL-*</code> advisories for npm and PyPI, pulled with a single script. Catches typosquats and supply-chain attacks the moment Claude tries to install one. Schedule it via cron or Task Scheduler; the hook reads the latest set on every invocation.</p>
-      </article>
-
-      <article class="feature">
-        <span class="feature__tag">llm second opinion</span>
-        <h3>Haiku 4.5 weighs in on the ambiguous middle</h3>
-        <p>Optional, requires <code>ANTHROPIC_API_KEY</code>. Ask-band commands get a 3 second LLM review with the full risk breakdown. High-confidence "allow" verdicts auto-apply. "Deny" verdicts annotate the human prompt with strong warnings, never block on the human's behalf.</p>
       </article>
 
       <article class="feature">
@@ -1043,26 +1036,13 @@ footer .credit {
       <div class="step">
         <span class="step__num" aria-hidden="true">02</span>
         <div class="step__body">
-          <h3>Optional: the LLM key</h3>
-          <p>For the Haiku 4.5 second opinion on ambiguous commands. claude-guard works without this; you just don't get the LLM review. If you set it, the hook calls api.anthropic.com only for commands in the ask band (score 25 to 59), with a 3 second hard timeout.</p>
-          <pre class="code-block"><span class="c"># bash / zsh</span>
-<span class="p">$</span> export ANTHROPIC_API_KEY=<span class="c">"sk-ant-..."</span>
-
-<span class="c"># PowerShell (persistent across sessions)</span>
-<span class="p">&gt;</span> setx ANTHROPIC_API_KEY <span class="c">"sk-ant-..."</span></pre>
-        </div>
-      </div>
-
-      <div class="step">
-        <span class="step__num" aria-hidden="true">03</span>
-        <div class="step__body">
           <h3>Open a new Claude Code session</h3>
           <p>That's it. There's no daemon to start. The <code>PreToolUse</code> hook fires on every Bash, Edit, Write, and MCP tool call. Boring stuff goes through silently. Ambiguous stuff still asks. Dangerous stuff gets blocked. Existing sessions won't pick up the hook until you restart them.</p>
         </div>
       </div>
 
       <div class="step">
-        <span class="step__num" aria-hidden="true">04</span>
+        <span class="step__num" aria-hidden="true">03</span>
         <div class="step__body">
           <h3>Verify it's running</h3>
           <p>Run the self-test from anywhere — it scores a fixture of common commands and prints the breakdown:</p>
@@ -1094,7 +1074,7 @@ footer .credit {
       <details>
         <summary>Does it phone home?</summary>
         <div class="faq__answer">
-          <p>No. The hook itself makes zero network calls. The threat feed updater talks to OSV.dev on your schedule, when you run it. The LLM fallback talks to api.anthropic.com only if you opt in by setting <code>ANTHROPIC_API_KEY</code>. There is no telemetry, no usage reporting, no analytics, no nothing.</p>
+          <p>No. The hook makes zero network calls. The threat feed updater talks to OSV.dev on your schedule, when you run it. There is no telemetry, no usage reporting, no analytics, no nothing — the engine is pure local scoring plus rules, by design.</p>
         </div>
       </details>
 
@@ -1109,13 +1089,6 @@ footer .credit {
         <summary>Can I tune it for my workflows?</summary>
         <div class="faq__answer">
           <p>Yes. After a week of real use, run <code>python tune.py review</code>. It clusters the ask-band commands you keep getting prompted on, suggests an allowlist regex for each cluster, and writes them to <code>rules_user.py</code> on your approval. The base <code>rules.py</code> is never modified; pulling updates from the repo stays clean.</p>
-        </div>
-      </details>
-
-      <details>
-        <summary>Do I need the LLM API key for it to work?</summary>
-        <div class="faq__answer">
-          <p>No. Everything works without it. The key only enables the optional Haiku 4.5 second-opinion on the ambiguous middle band. You get pattern, path, network, anomaly, and context scoring regardless. The LLM is a nice extra, not the core.</p>
         </div>
       </details>
 

@@ -312,10 +312,9 @@ A future improvement is a sidecar script that pulls these weekly and merges them
 In rough priority order:
 
 1. **Sidecar updater** that fetches the GHSA + OSV feeds and writes a fresh `COMPROMISED_PACKAGES` block, run on a schedule.
-2. **LLM-fallback rule** using Claude Code's `type: "prompt"` hooks for the ambiguous ask-band cases. The Haiku-classified decision gets a small point adjustment so the human prompt becomes "we think this is fine because X" rather than "here's a raw breakdown."
-3. **Project-aware allow rules.** Rather than one global rules.py, support a `.claude/guard/project.py` that adds project-specific allowlist patterns (e.g., per-client conventions) without forking the base rules.
-4. **VS Code extension** as originally discussed: sidebar showing recent decisions from `audit.jsonl`, one-click "add to allowlist" buttons, a "tighten thresholds" toggle. This is polish on top of the engine, not a replacement.
-5. **Decision feedback loop.** Track which "ask" prompts the human approved versus rejected; surface rules whose ask-approval rate is >95% as candidates for moving into the allow band.
+2. **Project-aware allow rules.** Rather than one global rules.py, support a `.claude/guard/project.py` that adds project-specific allowlist patterns (e.g., per-client conventions) without forking the base rules.
+3. **VS Code extension** as originally discussed: sidebar showing recent decisions from `audit.jsonl`, one-click "add to allowlist" buttons, a "tighten thresholds" toggle. This is polish on top of the engine, not a replacement.
+4. **Decision feedback loop.** Track which "ask" prompts the human approved versus rejected; surface rules whose ask-approval rate is >95% as candidates for moving into the allow band.
 
 ## Files in this folder
 

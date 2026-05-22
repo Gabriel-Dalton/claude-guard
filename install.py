@@ -30,7 +30,6 @@ from pathlib import Path
 FILES = [
     "claude-guard.py",
     "rules.py",
-    "llm_fallback.py",
     "anomaly.py",
     "tune.py",
     "update_threat_feed.py",
@@ -394,16 +393,10 @@ def print_done(mode: str, install_dir: Path, settings_file: Path,
     print("  1. Open a new Claude Code session in any project. The hook fires "
           "on every Bash command.")
     print()
-    print("  2. Optional, for the LLM second opinion on ambiguous commands:")
-    print(color("       setx ANTHROPIC_API_KEY \"sk-ant-...\"", "36")
-          + "   (PowerShell, persistent)")
-    print(color("       export ANTHROPIC_API_KEY=\"sk-ant-...\"", "36")
-          + "  (bash, current shell)")
-    print()
-    print("  3. After a week of real use, tune the noisy ask-band away:")
+    print("  2. After a week of real use, tune the noisy ask-band away:")
     print(color(f"       python \"{install_dir / 'tune.py'}\" review", "36"))
     print()
-    print("  4. To refresh the malicious-package feed (run nightly via "
+    print("  3. To refresh the malicious-package feed (run nightly via "
           "cron / Task Scheduler):")
     print(color(f"       python \"{install_dir / 'update_threat_feed.py'}\"", "36"))
     print()

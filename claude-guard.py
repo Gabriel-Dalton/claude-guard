@@ -87,11 +87,6 @@ except Exception as _e:  # ImportError, SyntaxError, NameError, etc.
 # Optional V2 modules. Each is feature-detected so the hook keeps working
 # even if a module is broken or absent.
 try:
-    import llm_fallback as _llm_mod
-except Exception:
-    _llm_mod = None
-
-try:
     import anomaly as _anomaly_mod
 except Exception:
     _anomaly_mod = None
@@ -616,7 +611,7 @@ def format_breakdown(signals: list) -> str:
 
 
 def emit(decision: str, score: int, signals: list, ctx: Context,
-         timing: dict, llm_verdict: Optional[dict]):
+         timing: dict):
     breakdown = format_breakdown(signals)
     summary = (
         f"claude-guard score: {score}/100 -> {decision.upper()}\n"
@@ -632,11 +627,11 @@ def emit(decision: str, score: int, signals: list, ctx: Context,
         }
     }
     print(json.dumps(output))
-    log_decision(decision, score, signals, ctx, timing, llm_verdict)
+    log_decision(decision, score, signals, ctx, timing)
 
 
 def log_decision(decision: str, score: int, signals: list, ctx: Context,
-                 timing: dict, llm_verdict: Optional[dict]):
+                 timing: dict):
     log_path = Path(__file__).resolve().parent / "audit.jsonl"
     entry = {
         "ts": datetime.now(timezone.utc).isoformat(),
@@ -652,7 +647,6 @@ def log_decision(decision: str, score: int, signals: list, ctx: Context,
         "network_targets": ctx.network_targets,
         "signals": [asdict(s) for s in signals],
         "timing": timing,
-        "llm_verdict": llm_verdict,
     }
     try:
         with log_path.open("a", encoding="utf-8") as f:
@@ -778,48 +772,12 @@ def _main_inner():
     else:
         decision = map_score_to_decision(score)
 
-    llm_verdict = None
-    if (
-        decision == "ask"
-        and tool_name == "Bash"
-        and _llm_mod is not None
-        and not (hard_allow or hard_deny)
-    ):
-        try:
-            llm_verdict = _llm_mod.check(ctx, score, signals)
-        except Exception:
-            llm_verdict = None
-        if llm_verdict:
-            v = llm_verdict.get("verdict")
-            c = float(llm_verdict.get("confidence") or 0.0)
-            reasoning = llm_verdict.get("reasoning", "")
-            if v == "allow" and c > 0.85:
-                signals.append(Signal(
-                    "llm_allow", 0,
-                    f"LLM verdict ALLOW (conf {c:.2f}): {reasoning}",
-                ))
-                decision = "allow"
-            elif v == "deny":
-                signals.append(Signal(
-                    "llm_warning", 0,
-                    f"LLM verdict DENY (conf {c:.2f}): {reasoning}. "
-                    "Human approval is still required.",
-                ))
-            else:
-                signals.append(Signal(
-                    "llm_escalate", 0,
-                    f"LLM verdict ESCALATE (conf {c:.2f}): {reasoning}",
-                ))
-
-    t3 = time.perf_counter()
-
     timing = {
         "parse_ms":    round((t1 - t0) * 1000, 3),
         "evaluate_ms": round((t2 - t1) * 1000, 3),
-        "llm_ms":      round((t3 - t2) * 1000, 3),
     }
 
-    emit(decision, score, signals, ctx, timing, llm_verdict)
+    emit(decision, score, signals, ctx, timing)
 
     # Baseline updates only on allowed commands. Hard-allow counts too.
     if (
@@ -886,7 +844,6 @@ def run_self_test():
     print(f"FAIL_MODE: {FAIL_MODE}\n")
     if _RULES_LOAD_ERROR:
         print(f"!! rules.py error: {_RULES_LOAD_ERROR}\n")
-    print(f"llm_fallback module loaded: {bool(_llm_mod)}")
     print(f"anomaly module loaded:      {bool(_anomaly_mod)}")
     print("=" * 78)
 
