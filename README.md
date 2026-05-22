@@ -213,6 +213,28 @@ Claude Code's built-in check flagged "spawns a nested PowerShell process which c
 
 If the same command pointed at a script outside the project, or stripped the `-DryRun` flag and started touching `~/.ssh/`, the score would climb. You'd see it climb in the audit log even before you saw a prompt, because every signal is recorded whether or not it ended up changing the decision.
 
+## Dashboard bridge (optional)
+
+By default, ask-band decisions fall through to Claude Code's native permission prompt — the dashboard just shows you what happened. If you'd rather approve or deny from the dashboard tab instead of the terminal, flip the bridge on:
+
+```python
+# rules.py
+DASHBOARD_BRIDGE_ENABLED = True   # default False
+DASHBOARD_BRIDGE_TIMEOUT_S = 60   # how long the hook waits for your click
+```
+
+With the bridge on **and** the dashboard running, every ask-band decision pops a card at the top of the dashboard with the command, score, signal breakdown, and Approve / Deny buttons. Your click flows back to the waiting hook within ~1 second; Claude Code never shows its native prompt for that decision. If you grant browser-notification permission on first load, you also get a system notification for every new pending decision, so a backgrounded dashboard tab still pages you.
+
+**Behavior when the dashboard isn't running.** The hook checks for a live dashboard PID before publishing to the bridge channel. If nothing's listening, the hook falls through to the native prompt immediately — no 60-second hang. So leaving the flag on across machines with and without the dashboard is safe.
+
+**Timeout.** If you don't click within `DASHBOARD_BRIDGE_TIMEOUT_S`, the hook gives up and falls through to the native prompt. A note is printed to stderr so the audit trail records that the timeout happened. Increase or decrease as you like — the installer wires the hook's kill ceiling to 90 seconds, which leaves room for a 60-second bridge wait plus cold-start headroom.
+
+**Security model.** The bridge channel is two files in `$HOME/.claude/guard/pending/` (or `$env:USERPROFILE\.claude\guard\pending\` on Windows) per pending decision: a request written by the hook, a response written by the dashboard. The directory is chmod 0700 on POSIX; on Windows the default user-profile ACLs already restrict it. This is a single-user design. Any process that can write to that directory can grant permission to a tool call, so don't enable the bridge on a shared host.
+
+### How it works across terminals
+
+The hook is wired into `~/.claude/settings.json` (or `$env:USERPROFILE\.claude\settings.json` on Windows), which Claude Code reads on every session start regardless of which terminal launched it. PowerShell, cmd, Windows Terminal, the VS Code integrated terminal, WSL — all of them route through the same hook script and write to the same `pending/` directory. One dashboard tab shows every active session's pending decisions in one place; the Approve / Deny you click resolves the correct session's hook because each pending record carries a unique UUID.
+
 ## Configuration
 
 Everything you'll want to tune lives in `rules.py`. There's no separate config file; rules are Python data structures because they encode logic, not just values, and a Python module is the cleanest place to put both. Edit, save; the next hook invocation picks up the change. No restart, no rebuild.

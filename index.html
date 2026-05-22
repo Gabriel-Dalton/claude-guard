@@ -972,6 +972,18 @@ footer .credit {
       </article>
 
       <article class="feature">
+        <span class="feature__tag">live dashboard</span>
+        <h3>Every decision visible in real time</h3>
+        <p>A local single-file dashboard at <code>127.0.0.1:7475</code> auto-launches on every Claude Code session. Score histogram, decisions over time, top firing rules, tuning candidates. Zero dependencies, no chart libraries, no build step. Reads <code>audit.jsonl</code> on every poll so it always reflects the truth on disk.</p>
+      </article>
+
+      <article class="feature">
+        <span class="feature__tag">dashboard bridge</span>
+        <h3>Approve / deny from the browser, not the terminal</h3>
+        <p>Opt in with <code>DASHBOARD_BRIDGE_ENABLED = True</code>. Ask-band decisions surface as a card at the top of the dashboard with the command, score, and signal breakdown. One click resolves them; the waiting hook returns within a second. Browser notifications fire on backgrounded tabs. The hook falls through to Claude Code's native prompt if you don't click within 60 seconds or if the dashboard isn't running.</p>
+      </article>
+
+      <article class="feature">
         <span class="feature__tag">anomaly detection</span>
         <h3>Per-project behavioural baselines</h3>
         <p>Tracks which interpreters, domains, and directories are normal for each project. A first-time fetch to a never-seen domain adds points. Catches prompt-injection cases that static pattern rules can't see. Warmup is 50 commands; baseline updates only on allowed decisions.</p>
@@ -1096,6 +1108,13 @@ footer .credit {
         <summary>What if claude-guard itself breaks?</summary>
         <div class="faq__answer">
           <p>Default fail-mode is "closed." If <code>rules.py</code> has a syntax error, or any unexpected exception fires during evaluation, the hook emits an explanatory "ask" decision so you get prompted. It never silently bypasses Claude Code's permission system. The behaviour is configurable in <code>rules.py</code> if you'd rather fail open.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>Can I approve / deny from the dashboard instead of the terminal?</summary>
+        <div class="faq__answer">
+          <p>Yes &mdash; opt into the dashboard bridge. Set <code>DASHBOARD_BRIDGE_ENABLED = True</code> in <code>rules.py</code>. Ask-band decisions now appear as a card at the top of the dashboard with the full signal breakdown and Approve / Deny buttons. Your click flows back to the waiting hook; Claude Code never shows its native prompt for that decision. If you don't click within 60 seconds, the hook falls through to the native prompt &mdash; same as the dashboard-off behavior. It works across every terminal (PowerShell, cmd, Windows Terminal, VS Code integrated terminal, WSL) because they all share the same hook config and pending directory. Single-user design only; don't enable on a shared host.</p>
         </div>
       </details>
 
