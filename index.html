@@ -825,16 +825,14 @@ footer .credit {
         <div class="install-card__tabs" role="tablist" aria-label="Operating system">
           <button class="install-card__tab" role="tab" aria-selected="true"  aria-controls="cmd-unix"    id="tab-unix"    data-target="cmd-unix">macOS / Linux</button>
           <button class="install-card__tab" role="tab" aria-selected="false" aria-controls="cmd-windows" id="tab-windows" data-target="cmd-windows">Windows (PowerShell)</button>
-          <button class="install-card__tab" role="tab" aria-selected="false" aria-controls="cmd-cmd"     id="tab-cmd"     data-target="cmd-cmd">Windows (cmd)</button>
         </div>
       </div>
       <div class="install-card__body">
-        <pre class="install-card__cmd" id="cmd-unix"    role="tabpanel" aria-labelledby="tab-unix"    data-active="true"><code><span class="prompt">$</span>git clone https://github.com/Gabriel-Dalton/claude-guard ~/.claude/guard &amp;&amp; python ~/.claude/guard/install.py</code></pre>
-        <pre class="install-card__cmd" id="cmd-windows" role="tabpanel" aria-labelledby="tab-windows"><code><span class="prompt">&gt;</span>git clone https://github.com/Gabriel-Dalton/claude-guard "$env:USERPROFILE\.claude\guard"; python "$env:USERPROFILE\.claude\guard\install.py"</code></pre>
-        <pre class="install-card__cmd" id="cmd-cmd"     role="tabpanel" aria-labelledby="tab-cmd"><code><span class="prompt">&gt;</span>git clone https://github.com/Gabriel-Dalton/claude-guard "%USERPROFILE%\.claude\guard" &amp;&amp; python "%USERPROFILE%\.claude\guard\install.py"</code></pre>
+        <pre class="install-card__cmd" id="cmd-unix"    role="tabpanel" aria-labelledby="tab-unix"    data-active="true"><code><span class="prompt">$</span>curl -fsSL https://raw.githubusercontent.com/Gabriel-Dalton/claude-guard/main/bootstrap.sh | bash</code></pre>
+        <pre class="install-card__cmd" id="cmd-windows" role="tabpanel" aria-labelledby="tab-windows"><code><span class="prompt">&gt;</span>iwr https://raw.githubusercontent.com/Gabriel-Dalton/claude-guard/main/bootstrap.ps1 -UseBasicParsing | iex</code></pre>
         <button class="install-card__copy" type="button" id="copy-btn" aria-label="Copy install command to clipboard">copy</button>
       </div>
-      <p class="install-card__note">One line. Pick the tab that matches the shell you're running in &mdash; PowerShell uses <code>$env:USERPROFILE</code> and <code>;</code>, cmd.exe uses <code>%USERPROFILE%</code> and <code>&amp;&amp;</code>. The installer asks where to put it (global, fires for every project; or per-project), copies the files, wires the hook into your Claude Code settings.json. No telemetry. No daemon.</p>
+      <p class="install-card__note">One paste. The bootstrap clones (or pulls) into <code>$HOME/.claude/guard</code> on POSIX or <code>$env:USERPROFILE\.claude\guard</code> on Windows, stops any running dashboard, runs the installer with safe defaults. Re-runnable to update. Yes, <code>curl | bash</code> for a security tool is ironic &mdash; <a href="https://github.com/Gabriel-Dalton/claude-guard/blob/main/bootstrap.sh">review the script</a> first if you'd rather, or use the explicit git path below.</p>
     </div>
 
     <div class="stats" role="list">
@@ -1011,24 +1009,37 @@ footer .credit {
       <div class="step">
         <span class="step__num" aria-hidden="true">01</span>
         <div class="step__body">
-          <h3>Run the one line</h3>
-          <p>This is the recommended path: global install with no prompts. Clones the repo into <code>~/.claude/guard/</code>, copies the hook files, merges the <code>PreToolUse</code> + <code>SessionStart</code> hooks into <code>~/.claude/settings.json</code>, and fetches the malicious-package threat feed. Re-runnable.</p>
+          <h3>Option A &mdash; one paste</h3>
+          <p>The bootstrap clones (or pulls) into the install directory, stops any running dashboard, runs <code>install.py --global --yes</code>, prints a success line. Re-run any time to update.</p>
 
           <h4>macOS / Linux</h4>
-          <pre class="code-block"><span class="p">$</span> git clone https://github.com/Gabriel-Dalton/claude-guard ~/.claude/guard <span class="c">\</span>
-    &amp;&amp; python ~/.claude/guard/install.py --global --yes</pre>
+          <pre class="code-block"><span class="p">$</span> curl -fsSL https://raw.githubusercontent.com/Gabriel-Dalton/claude-guard/main/bootstrap.sh | bash</pre>
 
           <h4 style="margin-top:1.5rem">Windows (PowerShell)</h4>
-          <pre class="code-block"><span class="p">&gt;</span> git clone https://github.com/Gabriel-Dalton/claude-guard <span class="c">`</span>
-    "<span class="c">$env:USERPROFILE</span>\.claude\guard"; <span class="c">`</span>
-  python "<span class="c">$env:USERPROFILE</span>\.claude\guard\install.py" --global --yes</pre>
-
-          <h4 style="margin-top:1.5rem">Windows (cmd.exe)</h4>
-          <pre class="code-block"><span class="p">&gt;</span> git clone https://github.com/Gabriel-Dalton/claude-guard "<span class="c">%USERPROFILE%</span>\.claude\guard" ^
-    &amp;&amp; python "<span class="c">%USERPROFILE%</span>\.claude\guard\install.py" --global --yes</pre>
+          <pre class="code-block"><span class="p">&gt;</span> iwr https://raw.githubusercontent.com/Gabriel-Dalton/claude-guard/main/bootstrap.ps1 -UseBasicParsing | iex</pre>
 
           <p style="margin-top:1.25rem; color: var(--fg-soft); font-size: 0.95em">
-            Want something different? Drop <code>--yes</code> to be prompted at each step. Use <code>--project /path/to/project</code> instead of <code>--global</code> to install for one folder only. Add <code>--skip-feed</code> to skip the ~30 sec threat-feed download.
+            <code>curl | bash</code> for a security tool? You can <a href="https://github.com/Gabriel-Dalton/claude-guard/blob/main/bootstrap.sh">read the bootstrap script</a> in seconds &mdash; or use Option B below to clone explicitly.
+          </p>
+
+          <h3 style="margin-top:2.25rem">Option B &mdash; explicit git clone</h3>
+          <p>Safe to paste twice; the conditional skips the clone if one already exists and just fast-forwards.</p>
+
+          <h4>macOS / Linux</h4>
+          <pre class="code-block"><span class="p">$</span> INSTALL_DIR=<span class="c">"$HOME/.claude/guard"</span>
+<span class="p">$</span> [ -f <span class="c">"$INSTALL_DIR/dashboard.py"</span> ] &amp;&amp; python3 <span class="c">"$INSTALL_DIR/dashboard.py"</span> --stop 2&gt;/dev/null
+<span class="p">$</span> [ -d <span class="c">"$INSTALL_DIR/.git"</span> ] &amp;&amp; git -C <span class="c">"$INSTALL_DIR"</span> pull --ff-only \
+    || git clone https://github.com/Gabriel-Dalton/claude-guard <span class="c">"$INSTALL_DIR"</span>
+<span class="p">$</span> python3 <span class="c">"$INSTALL_DIR/install.py"</span> --global --yes</pre>
+
+          <h4 style="margin-top:1.5rem">Windows (PowerShell)</h4>
+          <pre class="code-block"><span class="p">&gt;</span> <span class="c">$InstallDir</span> = <span class="c">"$env:USERPROFILE\.claude\guard"</span>
+<span class="p">&gt;</span> if (Test-Path <span class="c">"$InstallDir\dashboard.py"</span>) { python <span class="c">"$InstallDir\dashboard.py"</span> --stop 2&gt;<span class="c">$null</span> }
+<span class="p">&gt;</span> if (Test-Path <span class="c">"$InstallDir\.git"</span>) { git -C <span class="c">$InstallDir</span> pull --ff-only } else { git clone https://github.com/Gabriel-Dalton/claude-guard <span class="c">$InstallDir</span> }
+<span class="p">&gt;</span> python <span class="c">"$InstallDir\install.py"</span> --global --yes</pre>
+
+          <p style="margin-top:1.25rem; color: var(--fg-soft); font-size: 0.95em">
+            Want something different? Drop <code>--yes</code> to be prompted at each step. Use <code>--project /path/to/project</code> instead of <code>--global</code> to install for one folder only. Add <code>--skip-feed</code> to skip the threat-feed download.
           </p>
         </div>
       </div>
@@ -1045,11 +1056,14 @@ footer .credit {
         <span class="step__num" aria-hidden="true">03</span>
         <div class="step__body">
           <h3>Verify it's running</h3>
-          <p>Run the self-test from anywhere — it scores a fixture of common commands and prints the breakdown:</p>
-          <pre class="code-block"><span class="p">$</span> python ~/.claude/guard/claude-guard.py --test</pre>
+          <p>Run the self-test from anywhere &mdash; it scores a fixture of common commands and prints the breakdown:</p>
+          <h4>macOS / Linux</h4>
+          <pre class="code-block"><span class="p">$</span> python3 <span class="c">"$HOME/.claude/guard/claude-guard.py"</span> --test</pre>
+          <h4 style="margin-top:1rem">Windows (PowerShell)</h4>
+          <pre class="code-block"><span class="p">&gt;</span> python <span class="c">"$env:USERPROFILE\.claude\guard\claude-guard.py"</span> --test</pre>
           <p style="margin-top:1rem">Then watch live decisions roll in. The <code>SessionStart</code> hook auto-launches a local dashboard at:</p>
           <pre class="code-block"><span class="c">http://127.0.0.1:7475</span></pre>
-          <p style="margin-top:1rem">Raw decision log is at <code>~/.claude/guard/audit.jsonl</code>. After a week of real use, run <code>python ~/.claude/guard/tune.py review</code> to cluster noisy ask-band commands into clean allowlist entries.</p>
+          <p style="margin-top:1rem">The raw decision log is <code>audit.jsonl</code> next to the installer. After a week of real use, run <code>tune.py review</code> to cluster noisy ask-band commands into clean allowlist entries.</p>
         </div>
       </div>
 
@@ -1165,13 +1179,13 @@ footer .credit {
       <details>
         <summary>How do I update to the latest version?</summary>
         <div class="faq__answer">
-          <p>The install directory holds its own copy of the files. Pulling the source repo doesn't change the live hook until you re-run the installer.</p>
-          <pre class="code-block"><span class="c"># Stop the dashboard so it isn't holding files open</span>
-<span class="p">$</span> python ~/.claude/guard/dashboard.py --stop
-
-<span class="c"># Pull + reinstall</span>
-<span class="p">$</span> git -C ~/.claude/guard pull <span class="c">\</span>
-    &amp;&amp; python ~/.claude/guard/install.py --global --yes</pre>
+          <p>Re-run the same one-liner from the top of the page &mdash; the bootstrap is idempotent and handles stop + pull + reinstall. Or do it by hand:</p>
+          <h4>macOS / Linux</h4>
+          <pre class="code-block"><span class="p">$</span> python3 <span class="c">"$HOME/.claude/guard/dashboard.py"</span> --stop
+<span class="p">$</span> git -C <span class="c">"$HOME/.claude/guard"</span> pull &amp;&amp; python3 <span class="c">"$HOME/.claude/guard/install.py"</span> --global --yes</pre>
+          <h4 style="margin-top:1rem">Windows (PowerShell)</h4>
+          <pre class="code-block"><span class="p">&gt;</span> python <span class="c">"$env:USERPROFILE\.claude\guard\dashboard.py"</span> --stop
+<span class="p">&gt;</span> git -C <span class="c">"$env:USERPROFILE\.claude\guard"</span> pull; python <span class="c">"$env:USERPROFILE\.claude\guard\install.py"</span> --global --yes</pre>
           <p>Open a new Claude Code session and the dashboard relaunches.</p>
         </div>
       </details>

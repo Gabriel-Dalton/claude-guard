@@ -25,35 +25,62 @@ For every Bash tool call Claude makes, the hook does this:
 
 ## Install
 
-One global install protects every Claude Code project on this machine. Pick the line for your OS, paste it into a terminal, done.
+### Option A — one-paste install (recommended)
 
 **macOS / Linux**
 ```bash
-git clone https://github.com/Gabriel-Dalton/claude-guard ~/.claude/guard && python ~/.claude/guard/install.py --global --yes
+curl -fsSL https://raw.githubusercontent.com/Gabriel-Dalton/claude-guard/main/bootstrap.sh | bash
 ```
 
 **Windows (PowerShell)**
 ```powershell
-git clone https://github.com/Gabriel-Dalton/claude-guard "$env:USERPROFILE\.claude\guard"; python "$env:USERPROFILE\.claude\guard\install.py" --global --yes
+iwr https://raw.githubusercontent.com/Gabriel-Dalton/claude-guard/main/bootstrap.ps1 -UseBasicParsing | iex
 ```
 
-**Windows (cmd.exe)**
-```
-git clone https://github.com/Gabriel-Dalton/claude-guard "%USERPROFILE%\.claude\guard" && python "%USERPROFILE%\.claude\guard\install.py" --global --yes
+The bootstrap clones (or pulls) into the install directory, stops any running dashboard so files aren't held open, and runs `install.py --global --yes`. Re-run the same line any time to update. Yes, `curl | bash` for a security tool is ironic — [review the script first](https://github.com/Gabriel-Dalton/claude-guard/blob/main/bootstrap.sh) if you'd rather see what runs, or use Option B below to clone explicitly.
+
+### Option B — explicit git clone
+
+Paste-safe; running it twice does the right thing.
+
+**macOS / Linux**
+```bash
+INSTALL_DIR="$HOME/.claude/guard"
+[ -f "$INSTALL_DIR/dashboard.py" ] && python3 "$INSTALL_DIR/dashboard.py" --stop 2>/dev/null
+[ -d "$INSTALL_DIR/.git" ] && git -C "$INSTALL_DIR" pull --ff-only || git clone https://github.com/Gabriel-Dalton/claude-guard "$INSTALL_DIR"
+python3 "$INSTALL_DIR/install.py" --global --yes
 ```
 
-That clones the repo into `~/.claude/guard/`, copies the hook files into place, merges the `PreToolUse` + `SessionStart` hooks into `~/.claude/settings.json`, and (optionally) downloads the malicious-package threat feed. Re-running it is idempotent — safe to repeat after every `git pull`.
+**Windows (PowerShell)**
+```powershell
+$InstallDir = "$env:USERPROFILE\.claude\guard"
+if (Test-Path "$InstallDir\dashboard.py") { python "$InstallDir\dashboard.py" --stop 2>$null }
+if (Test-Path "$InstallDir\.git") {
+  git -C "$InstallDir" pull --ff-only
+} else {
+  git clone https://github.com/Gabriel-Dalton/claude-guard $InstallDir
+}
+python "$InstallDir\install.py" --global --yes
+```
+
+The block clones (or fast-forwards) the repo into the install directory, then runs the installer. Files land in `$HOME/.claude/guard/` on POSIX and `$env:USERPROFILE\.claude\guard\` on Windows. The installer is idempotent and safe to re-run after every `git pull`.
+
+### After install
+
+Open a new Claude Code session. The `PreToolUse` hook fires automatically on every Bash, Edit, Write, WebFetch, WebSearch, and MCP tool call. The dashboard auto-launches at http://127.0.0.1:7475.
 
 <details>
-<summary><strong>Other ways to install</strong></summary>
+<summary><strong>Other install options</strong></summary>
 
-- **Interactive (you get asked each step):** drop `--yes`. The installer prompts for global vs per-project, overwriting existing files, and fetching the threat feed.
+- **Interactive (asked at each step):** drop `--yes` from any of the snippets above.
 - **Per-project only (fires for one project, not the whole machine):**
   ```
   python install.py --project /path/to/project --yes
   ```
-  Files land in `<project>/.claude/guard/`, the hook is merged into `<project>/.claude/settings.json`.
-- **Skip the threat feed download:** add `--skip-feed`. You can fetch it later with `python ~/.claude/guard/update_threat_feed.py`.
+  Files land in `<project>/.claude/guard/`, the hook merges into `<project>/.claude/settings.json`.
+- **Skip the threat feed download:** add `--skip-feed`. Fetch it later with:
+  - POSIX: `python3 "$HOME/.claude/guard/update_threat_feed.py"`
+  - PowerShell: `python "$env:USERPROFILE\.claude\guard\update_threat_feed.py"`
 
 </details>
 
