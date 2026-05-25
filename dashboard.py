@@ -8,16 +8,21 @@ Usage:
     python dashboard.py --port 9000
     python dashboard.py --log /path/to/audit.jsonl
     python dashboard.py --no-browser
+    python dashboard.py --rotate   # one-shot archive of past-month entries
 
-The dashboard binds to 127.0.0.1, reads audit.jsonl fresh on every API
-request (no caching beyond the OS file cache), and the browser polls every
-two seconds. Python 3.9+ standard library only. No frameworks, no chart
+The dashboard binds to 127.0.0.1, reads audit.jsonl on every API request
+(parsed entries are cached in-memory until the file's mtime changes), and
+the browser polls every two seconds. A background thread rotates entries
+older than the current calendar month into audit-YYYY-MM.jsonl.gz archives
+next to the live log; these are read lazily when a query's window reaches
+back into them. Python 3.9+ standard library only. No frameworks, no chart
 libraries, no build step. See DASHBOARD.md for the design brief.
 """
 
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import os
 import re
@@ -28,7 +33,7 @@ import threading
 import time
 import webbrowser
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -81,35 +86,257 @@ WINDOWS = {
     "all": None,
 }
 
+# Rotation: archive files are named audit-YYYY-MM.jsonl.gz and live next to
+# the live log. The snapshot suffix is what an in-progress rotation renames
+# audit.jsonl to before splitting it into archives + tail; if a snapshot is
+# found on the next startup it gets processed (crash recovery).
+_ARCHIVE_RE = re.compile(r"^audit-(\d{4})-(\d{2})\.jsonl\.gz$")
+_ROTATION_SNAPSHOT_SUFFIX = ".rotating"
+ROTATION_INTERVAL_S = 3600
+
 
 # ============================================================================
-# Data layer — reads audit.jsonl on every call
+# Data layer — reads audit.jsonl with mtime-based parse cache + archive merge
 # ============================================================================
 
-def read_audit_log(path: Path) -> list[dict]:
-    """Return all decisions from the log, oldest-first.
+# Cache: (str_path, gzipped) -> (mtime, parsed_entries). Invalidated when
+# mtime changes. With 1s dashboard polling this keeps the hot read path off
+# the JSON parser; cold load is ~250 ms for a 26 MB live log, subsequent
+# polls drop to a few ms (stat + list copy).
+_PARSED_CACHE: dict[tuple[str, bool], tuple[float, list[dict]]] = {}
+_PARSED_CACHE_LOCK = threading.Lock()
 
-    Returns an empty list when the file is missing or unreadable. Malformed
-    lines are silently skipped — the log is append-only and may contain a
-    partial trailing line at any moment.
+
+def _read_jsonl(path: Path, gzipped: bool = False) -> list[dict]:
+    """Mtime-cached read of one JSONL file. Returns a fresh list each call so
+    a caller can mutate it (sort, reverse, …) without poisoning the cache.
+
+    Malformed lines are silently skipped — the log is append-only and may
+    contain a partial trailing line at any moment.
     """
     if not path.exists():
         return []
     try:
-        with path.open("r", encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
+        mtime = path.stat().st_mtime
     except OSError:
         return []
-    out = []
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
+    key = (str(path), gzipped)
+    with _PARSED_CACHE_LOCK:
+        cached = _PARSED_CACHE.get(key)
+        if cached and cached[0] == mtime:
+            return list(cached[1])
+
+    out: list[dict] = []
+    opener = gzip.open if gzipped else open
+    try:
+        with opener(path, "rb") as f:
+            for raw in f:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    out.append(json.loads(raw))
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+    except OSError:
+        return []
+
+    with _PARSED_CACHE_LOCK:
+        _PARSED_CACHE[key] = (mtime, out)
+    return list(out)
+
+
+def list_archives(audit_path: Path) -> list[tuple[int, int, Path]]:
+    """Return ``(year, month, path)`` for every audit-YYYY-MM.jsonl.gz next to
+    ``audit_path``, sorted oldest-first."""
+    parent = audit_path.parent
+    found: list[tuple[int, int, Path]] = []
+    try:
+        for p in parent.iterdir():
+            m = _ARCHIVE_RE.match(p.name)
+            if m:
+                found.append((int(m.group(1)), int(m.group(2)), p))
+    except OSError:
+        return []
+    found.sort(key=lambda t: (t[0], t[1]))
+    return found
+
+
+def _window_cutoff_ym(now: datetime, window: str) -> tuple[int, int]:
+    """Return the ``(year, month)`` at the start of ``window``. Archives whose
+    own ``(year, month)`` is >= this value are loaded; older ones are skipped.
+
+    ``"all"`` returns ``(0, 0)`` so every archive is loaded.
+    """
+    seconds = WINDOWS.get(window)
+    if seconds is None:
+        return (0, 0)
+    cutoff = now - timedelta(seconds=seconds)
+    return (cutoff.year, cutoff.month)
+
+
+def read_audit_log(path: Path, window: str | None = None) -> list[dict]:
+    """Return decisions oldest-first, sorted by ts.
+
+    When ``window`` is one of the WINDOWS keys, archive files whose calendar
+    month falls within the window are read first and concatenated with the
+    live log. Sorting by ts (rather than file order) makes callers robust to
+    the brief out-of-order tail that rotation leaves behind when it
+    re-appends snapshot entries after concurrent hook writes.
+
+    ``window=None`` (or an unrecognized value) reads only the live log, the
+    same shape the V3 dashboard had.
+    """
+    entries: list[dict] = []
+    if window in WINDOWS:
+        cutoff_ym = _window_cutoff_ym(datetime.now(timezone.utc), window)
+        for year, month, archive_path in list_archives(path):
+            if (year, month) >= cutoff_ym:
+                entries.extend(_read_jsonl(archive_path, gzipped=True))
+    entries.extend(_read_jsonl(path, gzipped=False))
+    entries.sort(key=lambda e: _parse_ts(e.get("ts")) or 0.0)
+    return entries
+
+
+# ----------------------------------------------------------------------------
+# Rotation
+# ----------------------------------------------------------------------------
+
+def _entry_ym(entry: dict) -> tuple[int, int] | None:
+    """``(year, month)`` for a decision entry, or None if its ts is unparseable."""
+    ts = entry.get("ts")
+    if not isinstance(ts, str):
+        return None
+    s = ts[:-1] + "+00:00" if ts.endswith("Z") else ts
+    try:
+        dt = datetime.fromisoformat(s)
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return (dt.year, dt.month)
+
+
+def _snapshot_path(audit_path: Path) -> Path:
+    return audit_path.with_name(audit_path.name + _ROTATION_SNAPSHOT_SUFFIX)
+
+
+def rotate_audit_log(audit_path: Path, now: datetime | None = None) -> int:
+    """Move entries older than the current calendar month into
+    ``audit-YYYY-MM.jsonl.gz`` archive files next to ``audit_path``.
+
+    Returns the number of entries archived (0 if nothing to do).
+
+    Concurrency: the hook keeps writing during rotation. We atomically rename
+    the live log to a snapshot so new appends land in a fresh file, then
+    split the snapshot into archives plus a current-month tail and re-append
+    the tail. The tail may interleave with hook writes in file order; ts
+    order is preserved because ``read_audit_log`` sorts by ts.
+
+    Crash recovery: if a snapshot from a previous run is found, it gets
+    processed first.
+    """
+    now = now or datetime.now(timezone.utc)
+    current_ym = (now.year, now.month)
+    archived = 0
+
+    snapshot = _snapshot_path(audit_path)
+    if snapshot.exists():
+        archived += _process_snapshot(snapshot, audit_path, current_ym)
+
+    if not audit_path.exists():
+        return archived
+
+    # Cheap pre-scan: only do the rename + rewrite dance if at least one
+    # entry actually predates the current month.
+    needs_rotate = False
+    try:
+        with audit_path.open("rb") as f:
+            for raw in f:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    entry = json.loads(raw)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                ym = _entry_ym(entry)
+                if ym is not None and ym < current_ym:
+                    needs_rotate = True
+                    break
+    except OSError:
+        return archived
+    if not needs_rotate:
+        return archived
+
+    try:
+        os.replace(str(audit_path), str(snapshot))
+    except OSError:
+        return archived
+
+    archived += _process_snapshot(snapshot, audit_path, current_ym)
+    return archived
+
+
+def _process_snapshot(snapshot: Path, live: Path,
+                      current_ym: tuple[int, int]) -> int:
+    """Split a renamed snapshot into per-month archive appends and a
+    current-month tail re-append. Idempotent enough for crash recovery: on
+    failure mid-way the snapshot is left in place for the next call."""
+    if not snapshot.exists():
+        return 0
+
+    by_month: dict[tuple[int, int], list[bytes]] = {}
+    tail: list[bytes] = []
+    archived = 0
+
+    try:
+        with snapshot.open("rb") as f:
+            for raw in f:
+                if not raw.strip():
+                    continue
+                line = raw if raw.endswith(b"\n") else raw + b"\n"
+                try:
+                    entry = json.loads(raw)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    # Keep unparseable rows in the live log so the user can
+                    # still see them; don't quietly archive them.
+                    tail.append(line)
+                    continue
+                ym = _entry_ym(entry)
+                if ym is None or ym >= current_ym:
+                    tail.append(line)
+                else:
+                    by_month.setdefault(ym, []).append(line)
+                    archived += 1
+    except OSError:
+        return 0
+
+    for (year, month), lines in by_month.items():
+        archive_path = live.parent / f"audit-{year:04d}-{month:02d}.jsonl.gz"
         try:
-            out.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
-    return out
+            with gzip.open(archive_path, "ab") as gz:
+                for line in lines:
+                    gz.write(line)
+        except OSError:
+            # Leave snapshot for retry; partial archive writes still leave a
+            # valid multi-member gzip, so retry is safe.
+            return archived
+
+    if tail:
+        try:
+            with live.open("ab") as f:
+                for line in tail:
+                    f.write(line)
+        except OSError:
+            return archived
+
+    try:
+        snapshot.unlink()
+    except OSError:
+        pass
+
+    return archived
 
 
 def _parse_ts(ts: object) -> float | None:
@@ -536,7 +763,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         window = _qparam(params, "window", "24h")
         if window not in WINDOWS:
             window = "24h"
-        entries = read_audit_log(self.log_path)
+        entries = read_audit_log(self.log_path, window=window)
         if not entries:
             self._serve_json({
                 "window": window,
@@ -579,7 +806,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         except (TypeError, ValueError):
             limit = DECISION_LIMIT
 
-        entries = read_audit_log(self.log_path)
+        entries = read_audit_log(self.log_path, window=window)
         entries = filter_by_window(entries, window)
         entries = filter_decisions(entries, decision_filter, query)
         # Newest first, capped to limit.
@@ -626,7 +853,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
             if current_mtime > since:
                 # New data — return immediately.
-                entries = read_audit_log(self.log_path)
+                entries = read_audit_log(self.log_path, window=window)
                 entries = filter_by_window(entries, window)
                 entries = filter_decisions(entries, decision_filter, query)
                 entries.reverse()
@@ -2540,6 +2767,13 @@ def main() -> int:
                         "first, escalates to a forced kill if still alive. "
                         "Idempotent — second call says 'dashboard not running'."
                     ))
+    ap.add_argument("--rotate", action="store_true",
+                    help=(
+                        "archive entries older than the current calendar "
+                        "month into audit-YYYY-MM.jsonl.gz next to the log, "
+                        "then exit. Same work the dashboard does hourly in "
+                        "the background, exposed for manual one-shot use."
+                    ))
     args = ap.parse_args()
 
     here = Path(__file__).resolve().parent
@@ -2551,6 +2785,14 @@ def main() -> int:
     if args.stop:
         status, msg = stop_running(log_path)
         print(msg)
+        return 0
+
+    if args.rotate:
+        archived = rotate_audit_log(log_path)
+        if archived:
+            print(f"archived {archived} entries next to {log_path}")
+        else:
+            print("nothing to rotate")
         return 0
 
     if args.ensure_running:
@@ -2575,6 +2817,19 @@ def main() -> int:
     print(f"claude-guard dashboard -> {url}")
     print(f"watching {log_path}")
     print("Press Ctrl-C to stop.")
+
+    # Rotation: archive past-month entries on startup, then every
+    # ROTATION_INTERVAL_S so a long-running dashboard catches month
+    # boundaries without restart. Failures are swallowed — the dashboard
+    # should never die because rotation hit an I/O error.
+    def _rotation_loop() -> None:
+        while True:
+            try:
+                rotate_audit_log(log_path)
+            except Exception:
+                pass
+            time.sleep(ROTATION_INTERVAL_S)
+    threading.Thread(target=_rotation_loop, daemon=True).start()
 
     if not args.no_browser:
         def _open() -> None:
