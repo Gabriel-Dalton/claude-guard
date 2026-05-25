@@ -352,7 +352,13 @@ The shell detection is heuristic. A command containing `$env:` or `Get-`/`Set-`/
 }
 ```
 
-Rotate or archive whenever you like. Nothing in the engine depends on the log; it's purely for your review.
+### Rotation
+
+The dashboard rotates the log on its own. Once an hour (and on dashboard startup), entries whose timestamp falls before the current calendar month are moved into `audit-YYYY-MM.jsonl.gz` files next to the live log. The live `audit.jsonl` stays small (at most the current month), so dashboard polls don't slow down as history grows. Archives are read lazily — only when a window (`7d`, `all`) reaches back into them.
+
+Nothing is ever destroyed: the engine never deletes archive files. If you want to clean up by hand, run `python dashboard.py --rotate` for a one-shot pass and then `gzip -dc audit-2026-04.jsonl.gz | jq .` to inspect.
+
+`tune.py` reads the archives too, so `--days N` queries that straddle a month boundary keep working.
 
 ## Updating compromised packages
 

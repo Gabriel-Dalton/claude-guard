@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import gzip
 import json
 import re
 import statistics
@@ -38,6 +39,11 @@ from typing import Iterator, Optional
 HERE = Path(__file__).resolve().parent
 AUDIT_PATH = HERE / "audit.jsonl"
 RULES_USER_PATH = HERE / "rules_user.py"
+
+# Archives written by dashboard.py rotation. tune.py reads them lazily so
+# `--days N` queries that reach back past the current calendar month don't
+# silently lose data.
+_ARCHIVE_RE = re.compile(r"^audit-(\d{4})-(\d{2})\.jsonl\.gz$")
 
 RULES_USER_TEMPLATE = (
     "# claude-guard user-tuned rules, written by tune.py. Hand-edit if you must,\n"
@@ -98,35 +104,68 @@ def parse_ts(ts: str) -> Optional[datetime]:
         return None
 
 
-def iter_audit_entries(path: Path, days: int, style: Style) -> Iterator[dict]:
-    """
-    Stream entries from audit.jsonl filtered to the last `days` days.
-
-    Malformed lines are counted and reported as a single summary warning.
-    """
-    if not path.exists():
-        print(style.warn(f"no audit log at {path}"))
-        print("nothing to do yet. run Claude Code with claude-guard wired up first.")
-        return
-
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-    malformed = 0
-    seen = 0
-
+def _archives_for_cutoff(audit_path: Path, cutoff: datetime) -> list[Path]:
+    """Archive files whose calendar month overlaps the cutoff window, ordered
+    oldest-first. Archives older than the cutoff month are skipped; archives
+    inside or after the cutoff month are returned for the caller to filter."""
+    parent = audit_path.parent
+    cutoff_ym = (cutoff.year, cutoff.month)
+    found: list[tuple[int, int, Path]] = []
     try:
-        f = path.open("r", encoding="utf-8")
-    except OSError as e:
-        print(style.warn(f"could not open {path}: {e}"))
-        return
+        for p in parent.iterdir():
+            m = _ARCHIVE_RE.match(p.name)
+            if m:
+                ym = (int(m.group(1)), int(m.group(2)))
+                if ym >= cutoff_ym:
+                    found.append((ym[0], ym[1], p))
+    except OSError:
+        return []
+    found.sort(key=lambda t: (t[0], t[1]))
+    return [p for _, _, p in found]
 
+
+def _iter_jsonl(path: Path, gzipped: bool) -> Iterator[tuple[Optional[dict], bool]]:
+    """Yield ``(entry, malformed)``. ``entry`` is None when ``malformed`` is True.
+    OS errors swallow the iterator — caller sees the prefix it managed to read."""
+    opener = gzip.open if gzipped else open
+    try:
+        f = opener(path, "rt", encoding="utf-8")
+    except OSError:
+        return
     with f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
             try:
-                entry = json.loads(line)
+                yield json.loads(line), False
             except json.JSONDecodeError:
+                yield None, True
+
+
+def iter_audit_entries(path: Path, days: int, style: Style) -> Iterator[dict]:
+    """
+    Stream entries from audit.jsonl plus any audit-YYYY-MM.jsonl.gz archives
+    that overlap the last ``days`` days, filtered to entries within the window.
+
+    Malformed lines are counted and reported as a single summary warning.
+    """
+    archives = _archives_for_cutoff(path, datetime.now(timezone.utc) - timedelta(days=days))
+    if not path.exists() and not archives:
+        print(style.warn(f"no audit log at {path}"))
+        print("nothing to do yet. run Claude Code with claude-guard wired up first.")
+        return
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    malformed = 0
+
+    sources: list[tuple[Path, bool]] = [(a, True) for a in archives]
+    if path.exists():
+        sources.append((path, False))
+
+    for source_path, gzipped in sources:
+        for entry, bad in _iter_jsonl(source_path, gzipped):
+            if bad or entry is None:
                 malformed += 1
                 continue
             ts = parse_ts(entry.get("ts", ""))
@@ -138,11 +177,10 @@ def iter_audit_entries(path: Path, days: int, style: Style) -> Iterator[dict]:
                 ts = ts.replace(tzinfo=timezone.utc)
             if ts < cutoff:
                 continue
-            seen += 1
             yield entry
 
     if malformed:
-        print(style.warn(f"skipped {malformed} malformed line(s) in {path.name}"))
+        print(style.warn(f"skipped {malformed} malformed line(s) in audit log"))
 
 
 # ============================================================================
