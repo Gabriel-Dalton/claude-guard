@@ -46,3 +46,6 @@ merge-recovered.py
 vss-shadows.txt
 audit.pre-merge.jsonl
 audit.merged.jsonl
+
+# Local Claude Code state - machine-specific, never for a public repo
+.claude/
